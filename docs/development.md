@@ -98,7 +98,9 @@ Before declaring a visualization production-ready, inspect the Worker-served art
 - no console error or failed asset request;
 - the WebSocket connects, reconnects with a sequence, and pauses off-screen;
 - bursty asset requests do not produce more than one broadcast per second;
-- the persistent line and area paths change while point circles retain stable keys;
+- no historical point circles exist; only the persistent latest-point marker remains;
+- the persistent line, area, and latest marker interpolate between projections without accumulating animation frames;
+- reduced-motion mode applies each projection immediately;
 - the amber latest-point marker moves and remains distinguishable from preceding points;
 - labels do not overlap and horizontal overflow remains inside the chart on narrow screens;
 - the static snapshot remains legible with the Worker stopped.

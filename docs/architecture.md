@@ -28,7 +28,7 @@ Snapshot and WebSocket admission run retention before reading storage. They cann
 
 `src/visualizations/page-stream.ts` owns the single page connection. The first slice admits exactly one stream, `tail-latency`. The public socket is `GET /api/stream?streams=tail-latency&since=<sequence>`. The message handler validates and stores only the latest projection. One `requestAnimationFrame` callback coalesces arrivals before notifying active visualizations. An `IntersectionObserver` and page-visibility check close the connection while the chart is off-screen.
 
-`src/visualizations/tail-latency.ts` owns article-specific rendering. It updates persistent area and line paths, reuses point circles by key, removes only points that leave the declared window, and maintains separate persistent circles for the amber latest-point marker. It never replaces the SVG. The server-rendered version 2 projection remains as the static fallback.
+`src/visualizations/tail-latency.ts` owns article-specific rendering. It updates persistent area and line paths plus one amber latest-point circle; historical requests remain in path geometry without separate DOM nodes. One animation controller interpolates toward the newest eligible geometry, coalesces an in-flight replacement from the last painted frame, and owns at most one animation frame. It cancels work off-screen and applies updates immediately when `prefers-reduced-motion` is active. It never replaces the SVG or renders a point outside the declared window. The server-rendered version 2 projection remains as the static fallback.
 
 ## Sequence and recovery
 

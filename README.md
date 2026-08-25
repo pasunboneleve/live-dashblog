@@ -13,7 +13,7 @@ static Astro article + Worker request timing
   -> one hibernating page WebSocket with a keyed stream envelope
   -> latest projection buffer
   -> requestAnimationFrame
-  -> persistent keyed SVG line, area, and points
+  -> persistent SVG line, area, and latest-point marker
 ```
 
 ## Quick start

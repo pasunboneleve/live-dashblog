@@ -16,6 +16,7 @@ paths = [
   "src/components/TailLatencyDashboard.astro",
   "src/styles/global.css",
   "src/visualizations/page-stream.ts",
+  "src/visualizations/latest-value-animator.ts",
   "src/visualizations/tail-latency-geometry.ts",
   "src/visualizations/tail-latency.ts",
   "src/domain/public-stream-storage.ts",

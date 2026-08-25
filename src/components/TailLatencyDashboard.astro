@@ -35,11 +35,7 @@ function formatMilliseconds(value: number): string {
       </g>
       <path class="latency-area" data-area d={geometry.areaPath} aria-hidden="true"></path>
       <path class="latency-line" data-line d={geometry.linePath} aria-hidden="true"></path>
-      <g data-points aria-hidden="true">
-        {geometry.points.map((point) => <circle data-point={point.key} cx={point.x} cy={point.y} r="2.5"></circle>)}
-      </g>
-      <circle class="latest-halo" data-latest-halo data-visible={latest ? "true" : "false"} cx={latest?.x ?? 0} cy={latest?.y ?? 0} r="8" aria-hidden="true"></circle>
-      <circle class="latest-point" data-latest-point data-visible={latest ? "true" : "false"} cx={latest?.x ?? 0} cy={latest?.y ?? 0} r="4.5" aria-hidden="true"></circle>
+      <circle class="latest-point" data-latest-point data-visible={latest ? "true" : "false"} cx={latest?.x ?? 0} cy={latest?.y ?? 0} r="5" aria-hidden="true"></circle>
       <g class="axis-labels" aria-hidden="true">
         <text data-y-maximum x="38" y="20" text-anchor="end">{formatMilliseconds(geometry.yMaximumMs)}</text>
         <text x="38" y="188" text-anchor="end">0</text>
@@ -48,7 +44,7 @@ function formatMilliseconds(value: number): string {
       </g>
     </svg>
   </div>
-  <p class="footnote">Each point is one sanitized request timing. The amber point is latest. No paths, IP addresses, user agents, headers, bodies, or raw logs.</p>
+  <p class="footnote">Each bend records one sanitized request timing. The amber point is latest. No paths, IP addresses, user agents, headers, bodies, or raw logs.</p>
 </section>
 
 <script>
