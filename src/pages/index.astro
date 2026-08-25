@@ -1,0 +1,32 @@
+---
+import "../styles/global.css";
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width" />
+    <meta name="description" content="Operational essays whose diagrams are fed by the software serving them." />
+    <link rel="icon" href="/favicon.svg" />
+    <title>Live Dashblog</title>
+  </head>
+  <body>
+    <main class="mx-auto flex min-h-screen max-w-6xl flex-col justify-center px-5 py-20 md:px-10">
+      <p class="mb-5 text-xs tracking-[0.24em] text-[var(--cyan)] uppercase">Instrumented essays</p>
+      <h1 class="max-w-5xl text-5xl leading-[0.95] font-semibold tracking-[-0.055em] md:text-8xl">
+        The system explains itself while it runs.
+      </h1>
+      <p class="mt-8 max-w-2xl text-lg leading-relaxed text-[var(--muted)]">
+        Each essay pairs an operational idea with a live, privacy-bounded projection of this blog engine.
+      </p>
+      <a class="mt-14 grid max-w-3xl gap-3 border-t border-[var(--line)] py-7 no-underline md:grid-cols-[1fr_auto]" href="/posts/tail-latency/">
+        <span>
+          <strong class="block text-2xl text-[var(--ink)]">The request that everyone waits for</strong>
+          <span class="mt-2 block text-sm text-[var(--muted)]">Tail latency, drawn from this site’s request timings.</span>
+        </span>
+        <span class="self-center text-sm">Read essay →</span>
+      </a>
+    </main>
+  </body>
+</html>

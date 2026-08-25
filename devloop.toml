@@ -1,0 +1,91 @@
+root = "."
+debounce_ms = 300
+state_file = "./.devloop/state.json"
+startup_workflows = ["startup"]
+
+[watcher]
+kind = "poll"
+poll_interval_ms = 250
+
+[watch.site]
+paths = [
+  "src/pages/",
+  "src/layouts/",
+  "src/components/",
+  "src/styles/",
+  "src/visualizations/",
+  "src/domain/",
+  "public/",
+  "astro.config.mjs",
+]
+workflow = "site_changed"
+
+[watch.worker]
+paths = ["src/worker/"]
+workflow = "worker_changed"
+
+[watch.worker_config]
+paths = ["wrangler.jsonc"]
+workflow = "worker_config_changed"
+
+[hook.build_site]
+command = ["npm", "run", "build"]
+cwd = "."
+output = { inherit = true, body_style = "dim" }
+
+[hook.wait_worker]
+command = ["bash", "scripts/wait-for-worker.sh"]
+cwd = "."
+output = { inherit = true, body_style = "dim" }
+
+[process.worker]
+command = ["bash", "scripts/dev-worker.sh"]
+cwd = "."
+autostart = false
+restart = "always"
+output = { inherit = true, body_style = "plain" }
+
+[process.worker.readiness]
+kind = "http"
+url = "http://127.0.0.1:8787/__ready"
+interval_ms = 250
+timeout_ms = 30000
+
+[workflow.startup]
+steps = [
+  { action = "run_hook", hook = "build_site" },
+  { action = "start_process", process = "worker" },
+  { action = "run_hook", hook = "wait_worker" },
+  { action = "log", message = "live review: http://127.0.0.1:8787/posts/tail-latency/", style = "boxed" },
+]
+
+[workflow.site_changed]
+steps = [
+  { action = "run_hook", hook = "build_site" },
+  { action = "restart_process", process = "worker" },
+  { action = "run_hook", hook = "wait_worker" },
+  { action = "log", message = "Astro output rebuilt; supervised Worker restarted with the new assets.", style = "plain" },
+]
+triggers = ["browser_reload"]
+
+[workflow.worker_changed]
+steps = [
+  { action = "restart_process", process = "worker" },
+  { action = "run_hook", hook = "wait_worker" },
+  { action = "log", message = "Worker source changed; supervised Worker restarted and is ready.", style = "plain" },
+]
+triggers = ["browser_reload"]
+
+[workflow.worker_config_changed]
+steps = [
+  { action = "restart_process", process = "worker" },
+  { action = "run_hook", hook = "wait_worker" },
+  { action = "log", message = "Wrangler configuration changed; supervised Worker restarted.", style = "plain" },
+]
+triggers = ["browser_reload"]
+
+[workflow.browser_reload]
+steps = [
+  { action = "sleep_ms", duration_ms = 500 },
+  { action = "notify_reload" },
+]

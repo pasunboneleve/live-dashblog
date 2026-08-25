@@ -1,0 +1,28 @@
+{
+  "name": "live-dashblog",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "astro build",
+    "check": "npm run typecheck && npm run test && npm run build",
+    "dev": "astro dev",
+    "dev:worker": "npm run build && wrangler dev",
+    "test": "vitest run",
+    "typecheck": "astro check"
+  },
+  "dependencies": {
+    "@astrojs/mdx": "7.0.8",
+    "@tailwindcss/vite": "4.3.3",
+    "astro": "7.2.6",
+    "tailwindcss": "4.3.3",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@astrojs/check": "0.9.6",
+    "@cloudflare/workers-types": "5.20260823.1",
+    "typescript": "5.9.3",
+    "vitest": "4.1.11",
+    "wrangler": "4.125.0"
+  }
+}

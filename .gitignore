@@ -1,0 +1,21 @@
+.kata.local.toml
+node_modules/
+dist/
+.astro/
+.wrangler/
+.devloop/
+coverage/
+
+# Secrets and local provider sessions never belong in the repository.
+.env
+.env.*
+.dev.vars
+.dev.vars.*
+*.pem
+*.key
+
+# Terraform state may contain credentials or other sensitive values.
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
