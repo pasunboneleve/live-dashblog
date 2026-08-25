@@ -1,5 +1,7 @@
 # Live Dashblog
 
+[![CI](https://github.com/pasunboneleve/live-dashblog/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/pasunboneleve/live-dashblog/actions/workflows/ci.yml?query=branch%3Amain)
+
 Live Dashblog is a cost-restrained instrumented-essay blog. Astro publishes ordinary Markdown or MDX, while each post may import a purpose-built TypeScript visualization fed by a privacy-bounded projection of the Worker serving the site.
 
 The first slice explains tail latency with a rolling 60-second request line. It is a local scaffold: no Cloudflare or Bitwarden account has been accessed, and no resource has been deployed.
@@ -55,4 +57,4 @@ npm run check
 
 ## Status
 
-One vertical slice is implemented. The domain core has deterministic tests; Cloudflare deployment and live-account checks remain intentionally unperformed.
+One vertical slice is implemented. The domain core has deterministic tests, and the repository contains separate review and main-only deployment workflows. Cloudflare deployment and live-account checks remain intentionally unperformed.

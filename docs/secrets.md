@@ -39,6 +39,24 @@ scripts/put-worker-secret-from-bitwarden.sh --staged SECRET_BINDING BITWARDEN_IT
 
 That form pipes to `wrangler versions secret put`; a later explicitly authorized versions deployment must select the created version.
 
+## GitHub deployment credentials
+
+Bitwarden also remains the source of truth for the two credentials consumed by the main-only GitHub deployment workflow:
+
+- `CLOUDFLARE_ACCOUNT_ID`;
+- `CLOUDFLARE_API_TOKEN`.
+
+Store each value as the password of a dedicated Bitwarden item. After an explicit authorization to configure repository secrets, pipe each item directly to GitHub without printing or persisting it:
+
+```bash
+bw get password BITWARDEN_ACCOUNT_ID_ITEM --session "$BW_SESSION" \
+  | gh secret set CLOUDFLARE_ACCOUNT_ID --repo pasunboneleve/live-dashblog
+bw get password BITWARDEN_API_TOKEN_ITEM --session "$BW_SESSION" \
+  | gh secret set CLOUDFLARE_API_TOKEN --repo pasunboneleve/live-dashblog
+```
+
+These commands mutate GitHub repository settings. Do not run them during ordinary validation or deployment preparation. Never pass a secret on a command line, enable shell tracing, write it to GitHub workflow output, or place it in Terraform input or state. The workflow reads the values only through GitHub’s `secrets` context.
+
 ## Terraform authentication
 
 If Terraform is later added for DNS or custom-domain infrastructure, keep the Cloudflare API token in Bitwarden and run Terraform through:
@@ -55,7 +73,8 @@ The token exists only in the script process and Terraform child process. It is n
 2. Configure the correct Bitwarden server, run `bw login`, and unlock into `BW_SESSION` for the current shell.
 3. Install dependencies with `npm install` and run `npm run check`.
 4. Authenticate Wrangler separately only when remote Cloudflare work is authorized. Prefer Wrangler’s supported login or a least-privilege API token retrieved for the process.
-5. Confirm the Worker name and environment before sending any application secret.
-6. Lock Bitwarden and unset `BW_SESSION` after the operation.
+5. If unattended GitHub deployment must be recovered, restore `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` with the direct Bitwarden-to-GitHub pipes above; do not reconstruct them from logs or Terraform state.
+6. Confirm the Worker name and environment before sending any application secret.
+7. Lock Bitwarden and unset `BW_SESSION` after the operation.
 
 If the Bitwarden account cannot be recovered, rotate the affected Cloudflare API token and each Worker secret from the upstream issuer. Do not reconstruct values from Terraform state, terminal history, logs, or old local files.

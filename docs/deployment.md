@@ -15,6 +15,34 @@ npx wrangler deploy
 
 Do not run it until deployment is explicitly authorized. `DEVLOOP_BROWSER_EVENTS_URL` is a local supervisor value and must never be configured in a deployed Worker; leaving it absent keeps the development reload proxy disabled. Cloudflare’s [Astro guide](https://developers.cloudflare.com/workers/framework-guides/web-apps/astro/) recommends static output when pages do not need on-demand rendering, and its [Workers CLI guide](https://developers.cloudflare.com/workers/get-started/guide/) uses Wrangler for Worker deployment.
 
+## GitHub delivery workflow
+
+The repository follows the same broad branch shape as the public Rust blog while keeping Cloudflare as the only application platform:
+
+1. feature branches run [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) when a pull request opens or changes;
+2. the stable `CI / Validate` check installs the locked dependencies, runs `npm run check`, and performs a Wrangler dry run without Cloudflare credentials;
+3. reviewed changes merge to `main` through a non-squash merge;
+4. a push to `main` runs [`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml), repeats validation, and deploys the Worker with Wrangler.
+
+Pushing a feature branch does not deploy anything. The deployment workflow has read-only repository contents permission, serializes production deployments, and receives Cloudflare credentials only in its main-only job. Third-party actions are pinned to immutable commit SHAs with release comments.
+
+Repository policy is an operator step, not workflow code. Protect `main` after the first reviewed merge path exists: require pull requests, require `CI / Validate`, block direct pushes, disable squash merging, and retain merge commits. This repository does not configure those settings itself.
+
+No tag-triggered artifact workflow exists. This is an application deployment pipeline, not a versioned artifact release; tags do not deploy the Worker.
+
+## GitHub repository secrets
+
+The unattended deployment requires exactly two GitHub Actions repository secrets:
+
+- `CLOUDFLARE_ACCOUNT_ID` — the target Cloudflare account ID;
+- `CLOUDFLARE_API_TOKEN` — a dedicated deployment token created from Cloudflare’s **Edit Cloudflare Workers** template and restricted to the one target account.
+
+The current application has no Worker application secret. Do not add a Worker secret to the GitHub workflow unless a typed binding is introduced and its unattended rotation model is reviewed separately.
+
+Minimal Cloudflare setup is one existing account with Workers enabled, its account ID, and the scoped API token above. `wrangler.jsonc` already declares the `live-dashblog` Worker, static assets, the `TAIL_LATENCY` Durable Object binding, and its SQLite migration. The first authorized deployment creates or updates those application resources. Domain routing, DNS, rate limiting, billing notifications, and Terraform-managed account policy remain separate launch work.
+
+Cloudflare’s [GitHub Actions guidance](https://developers.cloudflare.com/workers/ci-cd/external-cicd/github-actions/) requires an API token and account ID for non-interactive Wrangler authentication, recommends restricting the token to the deployment account, and warns against storing the token in the repository. Store both GitHub values from Bitwarden as described in [secrets.md](secrets.md); never write them to a checked-in file, workflow output, build artifact, or Terraform state.
+
 ## Why Terraform does not deploy this application
 
 Cloudflare supports Worker uploads through Terraform, but its [infrastructure-as-code guidance](https://developers.cloudflare.com/workers/platform/infrastructure-as-code/) also describes using Terraform for the stable Worker resource while Wrangler owns bundling, versions, and deployments. This repository keeps one application configuration in `wrangler.jsonc`; duplicating its compatibility date, modules, asset manifest, bindings, and migration lifecycle in Terraform would create two owners.
