@@ -5,57 +5,68 @@
 - Required flow: `event stream -> reducer/domain core -> bounded projection -> latest projection buffer -> requestAnimationFrame render loop -> keyed/persistent SVG/DOM updates`.
 - `WebSocket handlers: may parse, enqueue, or store projections; must not redraw the UI directly.`
 - `Rendering: browser-cadence rendering with coalesced updates.`
-- `Every retained sample, replay, and projection collection has one documented bound; live connection admission is a separate launch gate.`
-- `Tests: deterministic reducer/projection tests plus rendered-page inspection under genuine stream load.`
+- `Every public stream declares one presentation window; raw rows, projections, replay, snapshots, and rendering enforce that same window.`
+- `Tests: deterministic reducer/projection tests, actual SQLite row-count tests, and rendered-page inspection under genuine stream load.`
 
-The checklist above is the standing contract for later stream types. This first slice covers sample and replay bounds, cadence, duplicate and out-of-order projection policy, persistent SVG updates, and rendered-page inspection under genuine request traffic. A later stream must define its own realistic test inputs and failure cases when it is introduced; the repository does not contain mock traffic requirements or empty framework modules for hypothetical streams.
+This is a repository invariant, not a tail-latency preference. `src/domain/tail-latency.ts` contains the typed `PUBLIC_STREAMS` allowlist. Every entry must be created through `definePublicStream`, which requires a duration, point cap, and broadcast cadence. The shared boundary derives the cutoff and replay capacity; a new stream is incomplete until its tests overfill both the time range and point cap and prove that projection, rendering, and physical storage stay within the declaration.
 
-## Ownership
+## One presentation window
 
-`src/domain/tail-latency.ts` owns the public schema and pure projection. It receives allowlisted samples and emits a complete, bounded projection. It performs no I/O and can be tested without Cloudflare.
+The tail-latency stream presents the inclusive interval `[now - 60 seconds, now]`, capped at the newest 300 points. Its one-second broadcast cadence derives a maximum of 61 replay projections for that same interval. These values are declared once in `TAIL_LATENCY_STREAM`; reducers, SQLite retention, snapshot and replay recovery, browser filtering, chart geometry, and expiry scheduling consume that definition.
 
-`src/worker/index.ts` owns measurement and Cloudflare I/O. The Worker measures only its static-asset fetch duration. One SQLite-backed Durable Object named `public` owns ordering, the 300-sample rolling reducer window, the current projection, 120 replay projections, and WebSocket fan-out. It emits at most once per second. A sample publishes immediately when no prior broadcast exists or the cadence interval has elapsed. A sample inside the interval schedules one persisted alarm for `last broadcast + 1 second`. Each projection persists the newest included sample ID. An immediate publish deletes any pending alarm; an alarm no-ops when no newer sample exists, otherwise re-runs the same cadence decision and reschedules rather than publishing early if another path has already broadcast. The object uses no in-memory interval or timeout, so it can hibernate while the alarm is pending.
+`src/domain/public-stream.ts` owns the definition and pure selection rules. `src/domain/public-stream-storage.ts` owns the storage enforcement interface. It hides the physical store behind five deletion operations, so the policy can be tested against real SQLite without coupling the domain to Cloudflare APIs. `src/worker/index.ts` implements those operations for Durable Object SQL and invokes them inside `transactionSync`.
 
-`src/visualizations/page-stream.ts` owns the single connection for the page. The first slice admits exactly one allowlisted stream, `tail-latency`; the keyed envelope prevents the client from accepting an unrelated payload and leaves a deliberate seam for adding a second allowlisted stream later. Multi-key admission is not implemented. The public socket is `GET /api/stream?streams=tail-latency&since=<sequence>`. `streams` must contain exactly that one allowlisted name. `since` is a non-negative safe integer; missing or invalid values become `0`, and `since=0` requests the current snapshot without replay. Unknown streams return `400`, and a request without a WebSocket upgrade returns `426`. The message handler validates and stores only the latest projection. One `requestAnimationFrame` callback coalesces arrivals before notifying active visualizations.
+Rows with timestamps before the cutoff or after `now` are physically deleted. Remaining sample rows are capped at 300 by observation time and insertion ID. Each replay row stores the timestamp of its oldest payload point; the row is deleted when that point crosses the cutoff. Replay is capped at 61 rows. Legacy rows with unknown coverage are unsafe and deleted. The current projection is rebuilt from surviving sample rows. The next hibernating alarm is the earlier of a pending cadence flush and one millisecond after the oldest point reaches the inclusive boundary. Expiry therefore continues when traffic pauses, without an in-memory interval.
 
-`src/visualizations/tail-latency.ts` owns the article-specific rendering. It updates the attributes and accessible labels of server-rendered SVG bars keyed by bucket. It never replaces the SVG. An `IntersectionObserver` and page-visibility check close the connection when the visualization is off-screen. The server-rendered projection remains as the static fallback.
+Snapshot and WebSocket admission run retention before reading storage. They cannot return an expired current payload or replay frame. The browser applies the same selector again and schedules its own presentation-only expiry repaint, so a disconnected or quiet page does not display an aged point while waiting for another server projection.
 
-The browser retries a dropped connection after two seconds. That browser timer does not keep the Durable Object awake; the no-in-memory-timer hibernation rule applies to server code. Live projections begin at sequence 1. Sequence 0 is the static fallback and may also cross the snapshot or WebSocket boundary as an explicit no-valid-live-projection sentinel. The browser rejects projections that are not newer than its current sequence, so sequence 0 preserves the server-rendered fallback for a new client and the last good live frame for a reconnecting client. `since=0` requests the current snapshot without replaying history.
+## Ownership and flow
+
+`src/domain/tail-latency.ts` owns the strict sanitized input schema and version 2 public projection. It receives keyed, allowlisted samples and emits ordered `{ key, durationMs, observedAt }` points plus `p50Ms`, `p95Ms`, `maxMs`, count, sequence, and generation time. It performs no I/O.
+
+`src/worker/index.ts` owns measurement and Cloudflare I/O. The Worker measures only static-asset fetch duration. One SQLite-backed Durable Object named `public` owns ordering, physical retention, the singleton current projection, bounded replay, hibernating alarms, and WebSocket fan-out. It broadcasts no more than once per second; an in-cadence burst schedules one persisted flush.
+
+`src/visualizations/page-stream.ts` owns the single page connection. The first slice admits exactly one stream, `tail-latency`. The public socket is `GET /api/stream?streams=tail-latency&since=<sequence>`. The message handler validates and stores only the latest projection. One `requestAnimationFrame` callback coalesces arrivals before notifying active visualizations. An `IntersectionObserver` and page-visibility check close the connection while the chart is off-screen.
+
+`src/visualizations/tail-latency.ts` owns article-specific rendering. It updates persistent area and line paths, reuses point circles by key, removes only points that leave the declared window, and maintains separate persistent circles for the amber latest-point marker. It never replaces the SVG. The server-rendered version 2 projection remains as the static fallback.
 
 ## Sequence and recovery
 
-Every broadcast projection receives a monotonic sequence. The browser first fetches the current snapshot, then opens the WebSocket with that sequence in `since`. On reconnect, the Durable Object replays up to 120 later projections only when the client sequence is contiguous with retained history. A new client, a missing replay window, or a sequence older than `oldest retained - 1` receives exactly the current snapshot. Gaps older than the replay bound are expected and are not repaired from another database. A corrupt replay payload also falls back to the current validated snapshot.
+Each broadcast receives a monotonic sequence. The browser fetches the current snapshot, then opens the WebSocket with that sequence in `since`. On reconnect, the object replays later retained projections only when the client overlaps replay storage. A new client, a missing range, a client older than the retained range, an expired range, or a malformed stored payload receives the current validated snapshot. Missing old history is expected and is not repaired from another database.
+
+Sequence 0 is the static fallback and the no-live-projection sentinel. The browser rejects duplicate and out-of-order sequences. Expiry may rebuild the persisted current payload at the existing sequence; browser-side expiry removes the same aged points immediately, and the next cadence projection carries the next sequence.
 
 ## Public telemetry contract
 
-Only these fields cross into storage:
+Only these fields enter storage:
 
-- `durationMs`: finite, non-negative, capped at 60 seconds;
-- `observedAt`: integer timestamp;
+- `durationMs`: non-negative and capped at 60 seconds;
+- `observedAt`: integer timestamp and the retention key;
 - `routeClass`: `home`, `article`, `asset`, or `other`;
 - `statusClass`: `2xx`, `3xx`, `4xx`, or `5xx`.
 
-The schema is strict, so extra fields fail validation. The engine does not retain request paths, query strings, IP addresses, user agents, headers, request bodies, secrets, or raw operational logs. Browsers can open allowlisted streams and read snapshots; any client WebSocket message closes the connection as a policy violation.
+The strict schema rejects extra fields. The engine never retains request paths, query strings, IP addresses, user agents, headers, bodies, secrets, or raw operational logs. Browsers are read-only; a client WebSocket message closes that connection as a policy violation.
 
-`routeClass`, `statusClass`, and `observedAt` are bounded classification metadata reserved for explicit later projections; projection version 1 reduces durations only. The sample window is trimmed by insertion ID, so `observedAt` is not an eviction key.
+## Storage growth audit
 
-## Public projection contract
+- `samples`: at most 300 rows, all in the current 60-second window;
+- `replay`: at most 61 rows, all generated in that window and individually deleted when their oldest point expires;
+- `current_projection`: exactly zero or one row through its singleton primary key;
+- `sqlite_sequence`: one metadata row for the sample table’s `AUTOINCREMENT` counter; its row count is fixed and it contains no telemetry point;
+- accepted WebSockets: hibernated runtime attachments, not historical telemetry; connection admission remains a public-launch rate-limiting gate.
 
-Version 1 uses bucket upper bounds of 25, 50, 100, 200, 400, 800, and 1,600 milliseconds, plus an overflow bucket. `p50Ms` and `p95Ms` use the nearest-rank method over capped durations in the current window. `maxMs`, `sampleCount`, `sequence`, `generatedAt`, `stream: "tail-latency"`, and the eight keyed histogram entries complete the projection. `GET /api/tail-latency/snapshot` returns that projection document with `Cache-Control: no-store`; the WebSocket envelope is `{ type: "projection", stream: "tail-latency", projection }`. Stored current and replay payloads pass the same schema before delivery; invalid storage falls back to the generated sequence-0 static projection.
-
-The strict `version: 1` schema rejects additive wire fields. A contract change therefore requires a new version schema and an explicit compatibility decision before deployment; it must not silently widen version 1.
+The deterministic storage test inserts substantially more samples and replay rows than allowed, asserts exact SQLite row counts, and advances the clock beyond the window without inserting traffic. A new stream must provide the same proof.
 
 ## Failure behavior
 
 - Invalid internal samples receive `400` and never enter the reducer.
-- Unknown public streams receive `400`.
-- A non-WebSocket stream request receives `426`.
-- A failed WebSocket delivery closes only that socket.
-- A missing live projection returns the static fallback.
-- A malformed internal JSON body receives `400` rather than escaping the Durable Object handler.
-- Background telemetry failure does not delay the asset response; Cloudflare can surface the failed `waitUntil` operation during local or platform inspection without exposing it to the browser.
-- HTML allows scripts and styles only from the same origin. Component CSS is emitted into the external Astro stylesheet, and WebSocket connections are restricted to the exact page origin.
+- Unknown public streams receive `400`; non-WebSocket stream requests receive `426`.
+- A failed delivery closes only that socket.
+- Missing or invalid live state returns the static fallback.
+- Malformed internal JSON receives `400`.
+- Background telemetry failure does not delay the asset response.
+- HTML allows scripts and styles only from the same origin; WebSockets are restricted to the page origin.
 
 ## Deliberate limits
 
-The first slice does not implement a general chart catalogue, plugin API, analytics warehouse, raw event archive, or separate realtime provider. A post imports its own TypeScript visualization. A future stream must add its public schema and reducer explicitly rather than receiving a generic operational payload. The rolling sample window follows insertion order of successful `record` calls, not client timestamps. Connected sockets are not a retained collection and have no application-level cap in this local slice; request shedding or rate limiting is therefore a hard public-launch gate.
+The project has no general chart catalogue, plugin API, analytics warehouse, raw archive, or separate realtime provider. A post imports its own TypeScript visualization. The shared stream definition and retention interface enforce the repository invariant without speculating about a generic telemetry framework. A later stream still adds its schema, reducer, persistence adapter, and over-capacity/expiry tests explicitly.

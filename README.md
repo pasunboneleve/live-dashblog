@@ -2,7 +2,7 @@
 
 Live Dashblog is a cost-restrained instrumented-essay blog. Astro publishes ordinary Markdown or MDX, while each post may import a purpose-built TypeScript visualization fed by a privacy-bounded projection of the Worker serving the site.
 
-The first slice explains tail latency with a rolling request-duration histogram. It is a local scaffold: no Cloudflare or Bitwarden account has been accessed, and no resource has been deployed.
+The first slice explains tail latency with a rolling 60-second request line. It is a local scaffold: no Cloudflare or Bitwarden account has been accessed, and no resource has been deployed.
 
 ## Architecture at a glance
 
@@ -13,7 +13,7 @@ static Astro article + Worker request timing
   -> one hibernating page WebSocket with a keyed stream envelope
   -> latest projection buffer
   -> requestAnimationFrame
-  -> persistent keyed SVG bars
+  -> persistent keyed SVG line, area, and points
 ```
 
 ## Quick start

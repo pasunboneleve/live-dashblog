@@ -1,7 +1,7 @@
 ---
 layout: ../../layouts/PostLayout.astro
 title: The request that everyone waits for
-description: A live, bounded histogram shows why the slowest requests shape a system more than its average does.
+description: A live, bounded request line shows why the slowest requests shape a system more than its average does.
 published: 25 August 2026
 ---
 
@@ -15,12 +15,12 @@ An average compresses a crowd into one number. That makes it useful for capacity
 
 ## Read the shape, not only the percentile
 
-The bars above count a rolling window of sanitized static-asset fetch durations inside this blog engine, not end-to-end browser latency. Their horizontal scale is deliberately uneven: each bucket doubles the previous limit. A thin right edge therefore carries more operational weight than its width suggests. The p95 marker asks a concrete question: how long did nineteen out of twenty recent engine fetches finish within?
+The line above orders sanitized static-asset fetch durations from this blog engine, not end-to-end browser latency. Each cyan point is a preceding request; the amber point is the latest. Their shared vertical scale makes the immediate comparison explicit. The p95 marker asks a concrete question: how long did nineteen out of twenty requests in the current window finish within?
 
-The display is a projection, not a log. The server discards paths, network addresses, user agents, headers, and request bodies. It retains only a capped duration, an allowlisted route class, a coarse status class, and an observation timestamp inside a 300-sample insertion-order window. The timestamp is not a retention key. Old projections fall out of the replay window.
+The display is a projection, not a log. The server discards paths, network addresses, user agents, headers, and request bodies. It retains only a capped duration, an allowlisted route class, a coarse status class, and an observation timestamp. At most 300 points may exist inside the current 60-second presentation window. The same timestamp boundary governs SQLite deletion, snapshots, replay, and browser rendering; a point that ages out is physically deleted and cannot return on reconnect.
 
 ## A tail is a coordination problem
 
 Tail latency often grows where independent delays meet. One request may need several resources, and the slowest resource gates the result. Retries can amplify the same congestion they attempt to escape. Queueing turns a brief burst into a longer wait. The useful response is not to worship one percentile; it is to locate which bounded class of work moves into the tail, then test whether the reducer’s next projection moves back.
 
-This essay’s chart follows that discipline. Network handlers validate and buffer projections. The browser renders at its own cadence and updates persistent SVG bars by key. When the chart leaves the viewport, its page-level connection closes. If realtime delivery is unavailable, the static snapshot remains readable.
+This essay’s chart follows that discipline. Network handlers validate and buffer projections. The browser renders at its own cadence, updates persistent line and area paths, and reuses point circles by key. When the chart leaves the viewport, its page-level connection closes. If realtime delivery is unavailable, the static snapshot remains readable.

@@ -58,27 +58,36 @@ a { color: var(--cyan); }
 .latency-panel .eyebrow { color: var(--amber); }
 .latency-panel h2 { margin: .45rem 0 0; font-size: clamp(1.5rem, 4vw, 2.5rem); letter-spacing: -.035em; }
 .latency-panel .connection { color: var(--cyan); white-space: nowrap; }
-.latency-panel .metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-bottom: 1px solid var(--line); }
+.latency-panel .metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-bottom: 1px solid var(--line); }
 .latency-panel .metrics div { padding: 1.1rem clamp(1.25rem, 3vw, 2rem); }
 .latency-panel .metrics div + div { border-left: 1px solid var(--line); }
 .latency-panel .metrics span { display: block; color: var(--muted); font-size: .72rem; text-transform: uppercase; letter-spacing: .12em; }
 .latency-panel .metrics strong { display: block; margin-top: .3rem; color: var(--ink); font-size: clamp(1.3rem, 3vw, 2rem); }
 .latency-panel .metrics strong span { display: inline; color: inherit; font: inherit; letter-spacing: inherit; }
 .latency-panel .chart-shell { padding: 1rem 1rem 0; overflow-x: auto; }
-.latency-panel svg { display: block; min-width: 42rem; width: 100%; height: auto; }
-.latency-panel rect { fill: var(--cyan); transition: y 240ms ease, height 240ms ease; }
-.latency-panel g:nth-of-type(9) rect, .latency-panel g:nth-of-type(10) rect { fill: var(--rose); }
+.latency-panel svg { display: block; min-width: 36rem; width: 100%; height: auto; }
 .latency-panel .grid line { stroke: var(--line); stroke-dasharray: 3 6; }
+.latency-panel .latency-area { fill: rgb(97 231 223 / 12%); transition: d 240ms ease; }
+.latency-panel .latency-line { fill: none; stroke: var(--cyan); stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; transition: d 240ms ease; }
+.latency-panel [data-points] circle { fill: var(--cyan); opacity: .5; transition: cx 240ms linear, cy 240ms ease; }
+.latency-panel .latest-halo { fill: rgb(255 189 89 / 20%); stroke: var(--amber); stroke-width: 1; }
+.latency-panel .latest-point { fill: var(--amber); stroke: var(--paper); stroke-width: 2; }
+.latency-panel [data-visible="false"] { display: none; }
 .latency-panel text { fill: var(--muted); font-size: 10px; }
-.latency-panel .axis-label { font-size: 9px; letter-spacing: .1em; text-transform: uppercase; }
+.latency-panel .axis-labels text { font-size: 9px; letter-spacing: .06em; text-transform: uppercase; }
 .latency-panel .footnote { padding: 0 2rem 1.5rem; color: var(--muted); letter-spacing: .06em; text-transform: none; }
 
 @media (max-width: 40rem) {
   .latency-panel .panel-heading { display: block; }
   .latency-panel .connection { margin-top: .8rem; }
   .latency-panel { margin-inline: 0; max-width: 100%; }
+  .latency-panel svg { min-width: 100%; }
+  .latency-panel .metrics { grid-template-columns: 1fr 1fr; }
+  .latency-panel .metrics div:last-child { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--line); }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .latency-panel rect { transition: none; }
+  .latency-panel .latency-area,
+  .latency-panel .latency-line,
+  .latency-panel [data-points] circle { transition: none; }
 }

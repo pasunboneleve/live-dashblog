@@ -1,17 +1,26 @@
 import {
-  REPLAY_LIMIT,
-  SAMPLE_LIMIT,
   STATIC_FALLBACK_PROJECTION,
   STREAM_NAME,
+  TAIL_LATENCY_STREAM,
   decideProjectionAction,
+  hasUnpublishedSample,
   projectTailLatency,
   publicTimingSampleSchema,
   selectRecoveryMode,
+  retainBroadcastCursor,
+  shouldPersistProjectionRefresh,
   tailLatencyProjectionSchema,
+  type KeyedTimingSample,
   type PublicTimingSample,
   type StreamEnvelope,
   type TailLatencyProjection,
 } from "../domain/tail-latency";
+import { nextPresentationExpiry } from "../domain/public-stream";
+import {
+  enforcePublicStreamRetention,
+  type PublicStreamRetentionStore,
+  type RetentionResult,
+} from "../domain/public-stream-storage";
 import { DurableObject } from "cloudflare:workers";
 
 interface Env {
@@ -50,6 +59,12 @@ interface ReplayRow {
 interface ReplayBoundsRow {
   [key: string]: SqlStorageValue;
   oldest_sequence: number | null;
+}
+
+interface AlarmSampleRow {
+  [key: string]: SqlStorageValue;
+  id: number;
+  observed_at: number;
 }
 
 export default {
@@ -120,6 +135,7 @@ export class TailLatencyRoom extends DurableObject<Env> {
         CREATE TABLE IF NOT EXISTS replay (
           sequence INTEGER PRIMARY KEY,
           generated_at INTEGER NOT NULL,
+          oldest_observed_at INTEGER,
           payload TEXT NOT NULL
         );
       `);
@@ -130,6 +146,12 @@ export class TailLatencyRoom extends DurableObject<Env> {
         this.ctx.storage.sql.exec(
           "ALTER TABLE current_projection ADD COLUMN last_sample_id INTEGER NOT NULL DEFAULT 0",
         );
+      }
+      const replayColumns = this.ctx.storage.sql.exec<{ name: string }>(
+        "PRAGMA table_info(replay)",
+      ).toArray();
+      if (!replayColumns.some((column) => column.name === "oldest_observed_at")) {
+        this.ctx.storage.sql.exec("ALTER TABLE replay ADD COLUMN oldest_observed_at INTEGER");
       }
     });
   }
@@ -152,13 +174,21 @@ export class TailLatencyRoom extends DurableObject<Env> {
 
   async alarm(): Promise<void> {
     const now = Date.now();
+    const retention = this.enforceRetention(now);
     const current = this.currentRow();
-    if (this.latestSampleId() <= (current?.last_sample_id ?? 0)) return;
-    const action = decideProjectionAction(current?.last_broadcast_at ?? null, now, false);
+    const cursor = retainBroadcastCursor(fromCurrentRow(current));
+    if (!hasUnpublishedSample(cursor, this.latestSampleId()) && !retention.timeExpired) {
+      await this.scheduleNextAlarm(now);
+      return;
+    }
+
+    const action = decideProjectionAction(current?.last_broadcast_at ?? null, now, null);
     if (action.kind === "publish") {
       this.publishProjection(now);
+      await this.scheduleNextAlarm(now);
     } else if (action.kind === "schedule") {
-      await this.ctx.storage.setAlarm(action.at);
+      if (retention.pointsDeleted > 0) this.persistCurrentProjection(now);
+      await this.scheduleNextAlarm(now, action.at);
     }
   }
 
@@ -166,29 +196,37 @@ export class TailLatencyRoom extends DurableObject<Env> {
     const parsed = publicTimingSampleSchema.safeParse(await parseRequestJson(request));
     if (!parsed.success) return new Response("Invalid public timing sample", { status: 400 });
 
-    const sample = parsed.data;
-    this.ctx.storage.sql.exec(
-      "INSERT INTO samples (duration_ms, observed_at, route_class, status_class) VALUES (?, ?, ?, ?)",
-      sample.durationMs, sample.observedAt, sample.routeClass, sample.statusClass,
-    );
-    this.ctx.storage.sql.exec(
-      "DELETE FROM samples WHERE id NOT IN (SELECT id FROM samples ORDER BY id DESC LIMIT ?)",
-      SAMPLE_LIMIT,
-    );
-
     const now = Date.now();
+    const sample = parsed.data;
+    const retention = this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        "INSERT INTO samples (duration_ms, observed_at, route_class, status_class) VALUES (?, ?, ?, ?)",
+        sample.durationMs, sample.observedAt, sample.routeClass, sample.statusClass,
+      );
+      return enforcePublicStreamRetention(
+        TAIL_LATENCY_STREAM,
+        retentionStore(this.ctx.storage.sql),
+        now,
+      );
+    });
+
     const current = this.currentRow();
-    const alarmScheduled = await this.ctx.storage.getAlarm() !== null;
+    const scheduledAlarmAt = await this.ctx.storage.getAlarm();
     const action = decideProjectionAction(
       current?.last_broadcast_at ?? null,
       now,
-      alarmScheduled,
+      scheduledAlarmAt,
     );
     if (action.kind === "publish") {
-      if (alarmScheduled) await this.ctx.storage.deleteAlarm();
+      if (scheduledAlarmAt !== null) await this.ctx.storage.deleteAlarm();
       this.publishProjection(now);
+      await this.scheduleNextAlarm(now);
     } else if (action.kind === "schedule") {
-      await this.ctx.storage.setAlarm(action.at);
+      if (retention.pointsDeleted > 0) this.persistCurrentProjection(now);
+      await this.scheduleNextAlarm(now, action.at);
+    } else {
+      if (retention.pointsDeleted > 0) this.persistCurrentProjection(now);
+      await this.scheduleNextAlarm(now, scheduledAlarmAt);
     }
 
     return new Response(null, { status: 202 });
@@ -196,14 +234,50 @@ export class TailLatencyRoom extends DurableObject<Env> {
 
   private publishProjection(now: number): void {
     const current = this.currentRow();
+    const projection = this.createProjection((current?.sequence ?? 0) + 1, now);
+    const payload = JSON.stringify(projection);
+    const lastSampleId = this.latestSampleId();
+
+    this.ctx.storage.transactionSync(() => {
+      enforcePublicStreamRetention(TAIL_LATENCY_STREAM, retentionStore(this.ctx.storage.sql), now);
+      this.writeCurrentProjection(projection, now, lastSampleId);
+      this.ctx.storage.sql.exec(
+        "INSERT INTO replay (sequence, generated_at, oldest_observed_at, payload) VALUES (?, ?, ?, ?)",
+        projection.sequence,
+        projection.generatedAt,
+        projection.points[0]?.observedAt ?? null,
+        payload,
+      );
+      enforcePublicStreamRetention(TAIL_LATENCY_STREAM, retentionStore(this.ctx.storage.sql), now);
+    });
+
+    this.broadcast(projection);
+  }
+
+  private persistCurrentProjection(now: number): void {
+    const current = this.currentRow();
+    const cursor = retainBroadcastCursor(fromCurrentRow(current));
+    const projection = this.createProjection(cursor.sequence, now);
+    this.writeCurrentProjection(
+      projection,
+      cursor.lastBroadcastAt,
+      cursor.lastSampleId,
+    );
+  }
+
+  private createProjection(sequence: number, now: number): TailLatencyProjection {
     const storedSamples = this.ctx.storage.sql.exec<StoredSampleRow>(
-      "SELECT id, duration_ms, observed_at, route_class, status_class FROM samples ORDER BY id",
+      "SELECT id, duration_ms, observed_at, route_class, status_class FROM samples ORDER BY observed_at, id",
     ).toArray();
     const samples = storedSamples.map(fromStoredSample);
-    const projection = projectTailLatency(samples, (current?.sequence ?? 0) + 1, now);
-    const payload = JSON.stringify(projection);
-    const lastSampleId = storedSamples.at(-1)?.id ?? 0;
+    return projectTailLatency(samples, sequence, now);
+  }
 
+  private writeCurrentProjection(
+    projection: TailLatencyProjection,
+    lastBroadcastAt: number,
+    lastSampleId: number,
+  ): void {
     this.ctx.storage.sql.exec(
       `INSERT INTO current_projection (singleton, sequence, generated_at, last_broadcast_at, last_sample_id, payload)
        VALUES (1, ?, ?, ?, ?, ?)
@@ -213,21 +287,16 @@ export class TailLatencyRoom extends DurableObject<Env> {
          last_broadcast_at = excluded.last_broadcast_at,
          last_sample_id = excluded.last_sample_id,
          payload = excluded.payload`,
-      projection.sequence, projection.generatedAt, now, lastSampleId, payload,
+      projection.sequence,
+      projection.generatedAt,
+      lastBroadcastAt,
+      lastSampleId,
+      JSON.stringify(projection),
     );
-    this.ctx.storage.sql.exec(
-      "INSERT INTO replay (sequence, generated_at, payload) VALUES (?, ?, ?)",
-      projection.sequence, projection.generatedAt, payload,
-    );
-    this.ctx.storage.sql.exec(
-      "DELETE FROM replay WHERE sequence NOT IN (SELECT sequence FROM replay ORDER BY sequence DESC LIMIT ?)",
-      REPLAY_LIMIT,
-    );
-
-    this.broadcast(projection);
   }
 
-  private snapshot(): Response {
+  private async snapshot(): Promise<Response> {
+    await this.refreshForRead(Date.now());
     return Response.json(this.readCurrentProjection(), {
       headers: {
         "cache-control": "no-store",
@@ -236,7 +305,8 @@ export class TailLatencyRoom extends DurableObject<Env> {
     });
   }
 
-  private connectWebSocket(request: Request): Response {
+  private async connectWebSocket(request: Request): Promise<Response> {
+    await this.refreshForRead(Date.now());
     const url = new URL(request.url);
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
       return new Response("Expected a WebSocket upgrade", { status: 426 });
@@ -258,7 +328,9 @@ export class TailLatencyRoom extends DurableObject<Env> {
     const mode = selectRecoveryMode(since, bounds?.oldest_sequence ?? null);
     const replay = mode === "replay"
       ? this.ctx.storage.sql.exec<ReplayRow>(
-          "SELECT payload FROM replay WHERE sequence > ? ORDER BY sequence LIMIT ?", since, REPLAY_LIMIT,
+          "SELECT payload FROM replay WHERE sequence > ? ORDER BY sequence LIMIT ?",
+          since,
+          TAIL_LATENCY_STREAM.replayLimit,
         ).toArray()
       : [];
     const recovered = replay.map((row) => tailLatencyProjectionSchema.safeParse(parseStoredJson(row.payload)));
@@ -270,6 +342,47 @@ export class TailLatencyRoom extends DurableObject<Env> {
       }
     }
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  private async refreshForRead(now: number): Promise<void> {
+    const retention = this.enforceRetention(now);
+    const current = this.currentRow();
+    const parsed = current ? tailLatencyProjectionSchema.safeParse(parseStoredJson(current.payload)) : null;
+    if (shouldPersistProjectionRefresh(
+      current !== undefined,
+      retention.pointsDeleted,
+      parsed?.success ?? false,
+    )) this.persistCurrentProjection(now);
+    await this.scheduleNextAlarm(now);
+  }
+
+  private enforceRetention(now: number): RetentionResult {
+    return this.ctx.storage.transactionSync(() => enforcePublicStreamRetention(
+      TAIL_LATENCY_STREAM,
+      retentionStore(this.ctx.storage.sql),
+      now,
+    ));
+  }
+
+  private async scheduleNextAlarm(now: number, cadenceAt: number | null = null): Promise<void> {
+    const samples = this.ctx.storage.sql.exec<AlarmSampleRow>(
+      "SELECT id, observed_at FROM samples ORDER BY observed_at, id",
+    ).toArray();
+    const expiryAt = nextPresentationExpiry(
+      TAIL_LATENCY_STREAM,
+      samples.map((sample) => ({ observedAt: sample.observed_at })),
+      now,
+    );
+    const candidates = [cadenceAt, expiryAt].filter((candidate): candidate is number => candidate !== null);
+    const scheduledAlarmAt = await this.ctx.storage.getAlarm();
+    if (candidates.length === 0) {
+      if (scheduledAlarmAt !== null) await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    const desiredAlarmAt = Math.min(...candidates);
+    if (scheduledAlarmAt === null || Math.abs(scheduledAlarmAt - desiredAlarmAt) >= 1) {
+      await this.ctx.storage.setAlarm(desiredAlarmAt);
+    }
   }
 
   private broadcast(projection: TailLatencyProjection): void {
@@ -303,8 +416,57 @@ function envelope(projection: TailLatencyProjection): StreamEnvelope {
   return { projection, stream: STREAM_NAME, type: "projection" };
 }
 
-function fromStoredSample(row: StoredSampleRow): PublicTimingSample {
-  return { durationMs: row.duration_ms, observedAt: row.observed_at, routeClass: row.route_class, statusClass: row.status_class };
+function fromCurrentRow(row: CurrentProjectionRow | undefined) {
+  return row
+    ? {
+        lastBroadcastAt: row.last_broadcast_at,
+        lastSampleId: row.last_sample_id,
+        sequence: row.sequence,
+      }
+    : null;
+}
+
+function fromStoredSample(row: StoredSampleRow): KeyedTimingSample {
+  return {
+    durationMs: row.duration_ms,
+    key: String(row.id),
+    observedAt: row.observed_at,
+    routeClass: row.route_class,
+    statusClass: row.status_class,
+  };
+}
+
+function retentionStore(sql: SqlStorage): PublicStreamRetentionStore {
+  return {
+    deletePointsBeyond: (limit) => sql.exec(
+      `DELETE FROM samples
+       WHERE id NOT IN (
+         SELECT id FROM samples ORDER BY observed_at DESC, id DESC LIMIT ?
+       )`,
+      limit,
+    ).rowsWritten,
+    deletePointsOutside: (cutoff, now) => sql.exec(
+      "DELETE FROM samples WHERE observed_at < ? OR observed_at > ?",
+      cutoff,
+      now,
+    ).rowsWritten,
+    deleteReplayBeyond: (limit) => sql.exec(
+      `DELETE FROM replay
+       WHERE sequence NOT IN (
+         SELECT sequence FROM replay ORDER BY sequence DESC LIMIT ?
+       )`,
+      limit,
+    ).rowsWritten,
+    deleteReplayContainingPointsBefore: (cutoff) => sql.exec(
+      "DELETE FROM replay WHERE oldest_observed_at IS NULL OR oldest_observed_at < ?",
+      cutoff,
+    ).rowsWritten,
+    deleteReplayOutside: (cutoff, now) => sql.exec(
+      "DELETE FROM replay WHERE generated_at < ? OR generated_at > ?",
+      cutoff,
+      now,
+    ).rowsWritten,
+  };
 }
 
 function classifyRoute(pathname: string): PublicTimingSample["routeClass"] {

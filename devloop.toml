@@ -9,19 +9,26 @@ poll_interval_ms = 250
 
 [watch.site]
 paths = [
-  "src/pages/",
-  "src/layouts/",
-  "src/components/",
-  "src/styles/",
-  "src/visualizations/",
-  "src/domain/",
-  "public/",
+  "src/pages/404.astro",
+  "src/pages/index.astro",
+  "src/pages/posts/tail-latency.mdx",
+  "src/layouts/PostLayout.astro",
+  "src/components/TailLatencyDashboard.astro",
+  "src/styles/global.css",
+  "src/visualizations/page-stream.ts",
+  "src/visualizations/tail-latency-geometry.ts",
+  "src/visualizations/tail-latency.ts",
+  "src/domain/public-stream-storage.ts",
+  "src/domain/public-stream.ts",
+  "src/domain/tail-latency.ts",
+  "public/devloop-reload.js",
+  "public/favicon.svg",
   "astro.config.mjs",
 ]
 workflow = "site_changed"
 
 [watch.worker]
-paths = ["src/worker/"]
+paths = ["src/worker/index.ts"]
 workflow = "worker_changed"
 
 [watch.worker_config]
