@@ -1,5 +1,104 @@
 # Architecture, privacy, and bounds
 
+## Architecture map
+
+The blog has two data planes. Runtime observability measures the public site while it serves readers. Deployment-time development metrics are fetched and reduced once, then shipped as an immutable static snapshot. They share the Astro publishing path and per-post visualization boundary, but they do not share credentials, persistence, or failure handling.
+
+```mermaid
+flowchart TB
+  subgraph delivery["Authoring and deployment"]
+    repo["Git repository<br/>Markdown, MDX, and visualization modules"]
+    trigger["Deployment workflow<br/>main push or scheduled refresh"]
+    flow["Appfire Flow<br/>initial development-metrics source"]
+    adapter["Planned: source adapter<br/>fetch, validate, aggregate, redact"]
+    metrics["Planned: immutable metrics snapshot<br/>schema, source window, generated time"]
+    build["Astro build"]
+    deploy["Wrangler deployment"]
+
+    repo --> trigger
+    trigger --> adapter
+    flow -. "deployment-only credential" .-> adapter
+    adapter --> metrics
+    repo --> build
+    metrics --> build
+    build --> deploy
+  end
+
+  subgraph edge["Cloudflare runtime"]
+    worker["Worker and static assets<br/>serve first, observe second"]
+    ingest["Planned: telemetry shedding gate"]
+    discard["Discard optional telemetry sample"]
+    admission["Planned: snapshot and WebSocket admission gate"]
+    room["SQLite Durable Object<br/>bounded samples, projection, and replay"]
+
+    deploy --> worker
+    worker --> ingest
+    ingest --> room
+    ingest -. "budget reached" .-> discard
+    admission --> room
+  end
+
+  subgraph reader["Reader browser"]
+    article["Article and static metrics snapshot"]
+    fallback["Embedded static observability fallback"]
+    buffer["Latest validated projection buffer"]
+    render["requestAnimationFrame<br/>persistent keyed DOM and SVG"]
+
+    article --> render
+    article --> fallback
+    fallback --> render
+    buffer --> render
+  end
+
+  browser["Reader requests"] --> worker
+  worker --> article
+  browser --> admission
+  room --> buffer
+  admission -. "limited or unavailable" .-> fallback
+```
+
+Nodes prefixed with `Planned:` are target architecture, not current implementation. The current vertical slice already contains the Worker, static assets, bounded Durable Object, public projection, embedded fallback, browser buffer, and browser-cadence renderer. Rate limiting, realtime admission shedding, the development-metrics adapter, and scheduled snapshot refresh remain to be built.
+
+The boundary is recorded in [the two-data-plane decision](decisions/0001-separate-runtime-and-deployment-metrics.md). It deliberately keeps the development-metrics source replaceable: [Appfire Flow](https://appfire.com/flow/info) is scheduled for retirement on 31 December 2027, although Appfire says existing API functionality remains available during the supported period.
+
+## Planned post data planes
+
+### Runtime observability
+
+The observability post uses real requests, not synthetic activity. One reader naturally generates several samples by loading the article, stylesheet, script, and favicon, so the visualization can move on a low-traffic site. When nobody visits, the presentation window drains to an honest empty state.
+
+Serving the article remains the primary path. Recording telemetry is an optional side effect: if ingestion reaches its budget, the Worker skips the sample and still serves the asset. Snapshot and WebSocket admission have their own ceiling. A denied connection, an unavailable Durable Object, or invalid live state leaves the embedded fallback visible rather than making the article fail.
+
+The viral-load contract is therefore:
+
+- static assets continue to serve;
+- telemetry writes, projection cadence, replay, and accepted realtime connections have explicit ceilings;
+- storage remains physically bounded by the presentation window and point cap;
+- browsers coalesce projections at paint cadence;
+- live-data failure degrades to a labeled static or last-valid view.
+
+The shedding and admission gates are public-launch blockers. They are not yet implemented.
+
+### Deployment-time development metrics
+
+A deployment job obtains aggregate development data through a source adapter, validates and reduces it, removes fields that are not explicitly public, and emits a small immutable snapshot into the Astro build. The browser downloads that snapshot as a static asset; it never contacts Flow and never receives its credentials.
+
+Every snapshot must declare:
+
+- a schema version;
+- when it was generated;
+- the source measurement window;
+- the allowlisted aggregate metrics;
+- enough provenance to explain the calculation without exposing private source records.
+
+A source or validation failure blocks the new deployment and leaves the previous successful deployment intact. The build must not silently publish an old snapshot as current. The article displays the snapshot time and measurement window so “current” has a precise meaning.
+
+Main-branch deployments refresh the snapshot. A scheduled deployment may refresh it without a content change when the chosen reporting interval requires that. The exact Flow API or export contract remains unresolved until the active account’s supported interface can be inspected; source-specific fields must stay inside the adapter.
+
+### Shared presentation boundary
+
+Each post owns its explanatory prose and purpose-built visualization. Runtime projections and deployment snapshots keep separate typed schemas, but both arrive at the visualization as bounded, validated, public data with an explicit time window. This is a small interoperability boundary, not a general chart catalogue or shared analytics warehouse.
+
 ## Standing realtime architecture
 
 - Required flow: `event stream -> reducer/domain core -> bounded projection -> latest projection buffer -> requestAnimationFrame render loop -> keyed/persistent SVG/DOM updates`.
