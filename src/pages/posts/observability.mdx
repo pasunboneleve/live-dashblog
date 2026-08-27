@@ -6,12 +6,12 @@ published: 27 August 2026
 telemetry: observability
 ---
 
-import TailLatencyDashboard from "../../components/TailLatencyDashboard.astro";
+import ObservabilityDashboard from "../../components/ObservabilityDashboard.astro";
 
 # The page that watches itself
 
 This request began a trace in the Cloudflare Worker. The HTML carried that context into the browser; the snapshot fetch carried it back through the Worker to the Durable Object. Each runtime records its own span, but only operation names, coarse status classes, durations, and parent IDs cross the public boundary.
 
-The line below is the previous instrument. Loading it creates the snapshot and stream spans that this post will unfold into a waterfall.
+The instrument below is reading the trace that contains its own snapshot and stream. Its numbers trail the newest request by one bounded assembly interval: a span must finish before the page can draw it, and the drawing itself is deliberately excluded from the public stream.
 
-<TailLatencyDashboard />
+<ObservabilityDashboard />

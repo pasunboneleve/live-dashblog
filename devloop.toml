@@ -15,9 +15,13 @@ paths = [
   "src/pages/posts/observability.mdx",
   "src/layouts/PostLayout.astro",
   "src/components/TailLatencyDashboard.astro",
+  "src/components/ObservabilityDashboard.astro",
   "src/components/ObservabilityTelemetry.astro",
   "src/styles/global.css",
   "src/visualizations/page-stream.ts",
+  "src/visualizations/observability-geometry.ts",
+  "src/visualizations/observability-stream.ts",
+  "src/visualizations/observability.ts",
   "src/telemetry/browser-otlp-exporter.ts",
   "src/telemetry/browser-telemetry-hooks.ts",
   "src/telemetry/browser-telemetry.ts",
@@ -26,6 +30,8 @@ paths = [
   "src/visualizations/tail-latency.ts",
   "src/domain/public-stream-storage.ts",
   "src/domain/public-stream.ts",
+  "src/domain/public-observability-sql.ts",
+  "src/domain/public-observability.ts",
   "src/domain/public-span.ts",
   "src/domain/fixtures/public-spans.ts",
   "src/domain/public-trace-sql.ts",
@@ -76,7 +82,7 @@ steps = [
   { action = "run_hook", hook = "build_site" },
   { action = "start_process", process = "worker" },
   { action = "run_hook", hook = "wait_worker" },
-  { action = "log", message = "live review: http://127.0.0.1:8787/posts/tail-latency/", style = "boxed" },
+  { action = "log", message = "live review: http://127.0.0.1:8787/posts/observability/", style = "boxed" },
 ]
 
 [workflow.site_changed]
