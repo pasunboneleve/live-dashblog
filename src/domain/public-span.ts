@@ -8,7 +8,7 @@ const spanIdSchema = z.string().regex(/^(?!0{16}$)[0-9a-f]{16}$/);
 const timestampSchema = z.number().int().nonnegative();
 const durationSchema = z.number().nonnegative().max(60_000);
 const statusSchema = z.enum(["unset", "ok", "error"]);
-const statusClassSchema = z.enum(["2xx", "3xx", "4xx", "5xx"]);
+const statusClassSchema = z.enum(["1xx", "2xx", "3xx", "4xx", "5xx"]);
 
 const identityShape = {
   durationMs: durationSchema,

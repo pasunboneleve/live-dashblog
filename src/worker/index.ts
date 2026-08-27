@@ -21,8 +21,14 @@ import {
   type PublicStreamRetentionStore,
   type RetentionResult,
 } from "../domain/public-stream-storage";
-import { DurableObject } from "cloudflare:workers";
-import { publicSpanBatchSchema } from "../domain/public-span";
+import { DurableObject, tracing } from "cloudflare:workers";
+import { publicSpanBatchSchema, type PublicSpan } from "../domain/public-span";
+import {
+  finishDurableObjectSpan,
+  finishWorkerSpan,
+  startPublicSpan,
+  type PublicServerOperation,
+} from "../domain/public-runtime-span";
 import {
   SqlPublicTraceStore,
   initializePublicTraceSchema,
@@ -43,6 +49,8 @@ interface Env {
   DEVLOOP_BROWSER_EVENTS_URL?: string;
   TAIL_LATENCY: DurableObjectNamespace<TailLatencyRoom>;
 }
+
+const OBSERVABILITY_ARTICLE_PATH = "/posts/observability/";
 
 interface StoredSampleRow {
   [key: string]: SqlStorageValue;
@@ -103,11 +111,19 @@ export default {
     if (isLoopbackHttpUrl(env.DEVLOOP_BROWSER_EVENTS_URL) &&
         (url.pathname === "/__devloop/public-spans" || url.pathname === "/__devloop/public-trace-state")) {
       const internalPath = url.pathname === "/__devloop/public-spans" ? "/public-spans" : "/public-trace-state";
-      return room.fetch(new Request(`https://observability.internal${internalPath}`, request));
+      return context.tracing.enterSpan("worker.span-intake", (span) => {
+        span.setAttribute("app.telemetry.route_class", "intake");
+        return room.fetch(new Request(`https://observability.internal${internalPath}`, request));
+      });
     }
 
-    if (url.pathname === "/api/stream" || url.pathname === "/api/tail-latency/snapshot") {
-      return room.fetch(request);
+    const publicServerOperation = serverOperation(url.pathname);
+    if (publicServerOperation) {
+      return tracePublicApiRequest(publicServerOperation, request, room, context);
+    }
+
+    if (request.method === "GET" && url.pathname.startsWith("/posts/")) {
+      return traceArticleRequest(request, url, env, room, context);
     }
 
     const startedAt = performance.now();
@@ -190,8 +206,12 @@ export class TailLatencyRoom extends DurableObject<Env> {
         oldestFirstSeenAt: store.oldestFirstSeenAt(),
       }, { headers: { "cache-control": "no-store" } });
     }
-    if (request.method === "GET" && url.pathname === "/api/tail-latency/snapshot") return this.snapshot();
-    if (request.method === "GET" && url.pathname === "/api/stream") return this.connectWebSocket(request);
+    if (request.method === "GET" && url.pathname === "/api/tail-latency/snapshot") {
+      return this.traceSnapshot(request);
+    }
+    if (request.method === "GET" && url.pathname === "/api/stream") {
+      return this.traceStreamConnect(request);
+    }
     return new Response("Not found", { status: 404 });
   }
 
@@ -240,6 +260,47 @@ export class TailLatencyRoom extends DurableObject<Env> {
       headers: { "cache-control": "no-store", "x-content-type-options": "nosniff" },
       status: 202,
     });
+  }
+
+  private async traceSnapshot(request: Request): Promise<Response> {
+    return tracing.enterSpan("durable-object.snapshot", async (nativeSpan) => {
+      nativeSpan.setAttribute("app.telemetry.operation_class", "snapshot");
+      const started = startPublicSpan(request.headers.get("traceparent"), Date.now());
+      const response = await this.snapshot();
+      await this.recordRuntimeSpan(finishDurableObjectSpan(
+        "snapshot",
+        started,
+        response.status,
+        Date.now(),
+      ));
+      return response;
+    });
+  }
+
+  private async traceStreamConnect(request: Request): Promise<Response> {
+    return tracing.enterSpan("durable-object.stream-connect", async (nativeSpan) => {
+      nativeSpan.setAttribute("app.telemetry.operation_class", "stream-connect");
+      const started = startPublicSpan(request.headers.get("traceparent"), Date.now());
+      const response = await this.connectWebSocket(request);
+      await this.recordRuntimeSpan(finishDurableObjectSpan(
+        "stream-connect",
+        started,
+        response.status,
+        Date.now(),
+      ));
+      return response;
+    });
+  }
+
+  private async recordRuntimeSpan(span: PublicSpan): Promise<void> {
+    const now = Date.now();
+    this.ctx.storage.transactionSync(() => ingestPublicSpanBatch(
+      PUBLIC_TRACE_STREAM,
+      this.publicTraceStore(),
+      [span],
+      now,
+    ));
+    await this.scheduleNextAlarm(now);
   }
 
   private async record(request: Request): Promise<Response> {
@@ -548,6 +609,100 @@ function cloudflareTraceSql(sql: SqlStorage): TraceSql {
       };
     },
   };
+}
+
+async function tracePublicApiRequest(
+  operation: Exclude<PublicServerOperation, "article">,
+  request: Request,
+  room: DurableObjectStub<TailLatencyRoom>,
+  context: ExecutionContext,
+): Promise<Response> {
+  return context.tracing.enterSpan(`worker.${operation}-request`, async (nativeSpan) => {
+    nativeSpan.setAttribute("app.telemetry.route_class", operation);
+    const started = startPublicSpan(request.headers.get("traceparent"), Date.now());
+    const response = await room.fetch(withTraceparent(request, started.traceparent));
+    nativeSpan.setAttribute("http.response.status_code", response.status);
+    context.waitUntil(recordPublicRuntimeSpan(
+      room,
+      finishWorkerSpan(operation, started, response.status, Date.now()),
+    ));
+    return response;
+  });
+}
+
+async function traceArticleRequest(
+  request: Request,
+  url: URL,
+  env: Env,
+  room: DurableObjectStub<TailLatencyRoom>,
+  context: ExecutionContext,
+): Promise<Response> {
+  return context.tracing.enterSpan("worker.article-request", async (nativeSpan) => {
+    nativeSpan.setAttribute("app.telemetry.route_class", "article");
+    const startedAt = performance.now();
+    const publicStarted = url.pathname === OBSERVABILITY_ARTICLE_PATH
+      ? startPublicSpan(null, Date.now())
+      : null;
+    let response = await env.ASSETS.fetch(request);
+
+    if (publicStarted) {
+      response = injectTraceparent(response, publicStarted.traceparent);
+      context.waitUntil(recordPublicRuntimeSpan(
+        room,
+        finishWorkerSpan("article", publicStarted, response.status, Date.now()),
+      ));
+    }
+
+    const sample = {
+      durationMs: Math.min(60_000, Math.max(0, performance.now() - startedAt)),
+      observedAt: Date.now(),
+      routeClass: "article",
+      statusClass: classifyStatus(response.status),
+    } satisfies PublicTimingSample;
+    context.waitUntil(room.fetch(new Request("https://tail-latency.internal/record", {
+      body: JSON.stringify(sample),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    })));
+    nativeSpan.setAttribute("http.response.status_code", response.status);
+    return withSecurityHeaders(response, url);
+  });
+}
+
+function recordPublicRuntimeSpan(
+  room: DurableObjectStub<TailLatencyRoom>,
+  span: PublicSpan,
+): Promise<Response> {
+  return room.fetch(new Request("https://observability.internal/public-spans", {
+    body: JSON.stringify([span]),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  }));
+}
+
+function withTraceparent(request: Request, traceparent: string): Request {
+  const headers = new Headers(request.headers);
+  headers.set("traceparent", traceparent);
+  return new Request(request, { headers });
+}
+
+function injectTraceparent(response: Response, traceparent: string): Response {
+  if (!response.headers.get("content-type")?.startsWith("text/html")) return response;
+  const transformed = new HTMLRewriter()
+    .on("head", {
+      element(element) {
+        element.prepend(`<meta name="traceparent" content="${traceparent}">`, { html: true });
+      },
+    })
+    .transform(response);
+  transformed.headers.set("cache-control", "no-store");
+  return transformed;
+}
+
+function serverOperation(pathname: string): Exclude<PublicServerOperation, "article"> | null {
+  if (pathname === "/api/tail-latency/snapshot") return "snapshot";
+  if (pathname === "/api/stream") return "stream";
+  return null;
 }
 
 function classifyRoute(pathname: string): PublicTimingSample["routeClass"] {

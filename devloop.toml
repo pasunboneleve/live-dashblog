@@ -25,6 +25,8 @@ paths = [
   "src/domain/fixtures/public-spans.ts",
   "src/domain/public-trace-sql.ts",
   "src/domain/public-trace-store.ts",
+  "src/domain/public-runtime-span.ts",
+  "src/domain/trace-context.ts",
   "src/domain/tail-latency.ts",
   "public/devloop-reload.js",
   "public/favicon.svg",
