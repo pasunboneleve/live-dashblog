@@ -23,6 +23,8 @@ paths = [
   "src/domain/public-stream.ts",
   "src/domain/public-span.ts",
   "src/domain/fixtures/public-spans.ts",
+  "src/domain/public-trace-sql.ts",
+  "src/domain/public-trace-store.ts",
   "src/domain/tail-latency.ts",
   "public/devloop-reload.js",
   "public/favicon.svg",

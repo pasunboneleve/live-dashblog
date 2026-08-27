@@ -145,6 +145,7 @@ export const publicSpanSchema = publicSpanVariantSchema.superRefine((span, conte
     context.addIssue({ code: "custom", message: "A span cannot parent itself.", path: ["parentSpanId"] });
   }
 });
+export const publicSpanBatchSchema = z.array(publicSpanSchema).min(1).max(32);
 
 export type PublicSpan = z.infer<typeof publicSpanSchema>;
 export const PUBLIC_SPAN_NAMES = Object.freeze(

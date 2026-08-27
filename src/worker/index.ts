@@ -22,6 +22,21 @@ import {
   type RetentionResult,
 } from "../domain/public-stream-storage";
 import { DurableObject } from "cloudflare:workers";
+import { publicSpanBatchSchema } from "../domain/public-span";
+import {
+  SqlPublicTraceStore,
+  initializePublicTraceSchema,
+  type TraceSql,
+  type TraceSqlCursor,
+  type TraceSqlValue,
+} from "../domain/public-trace-sql";
+import {
+  PUBLIC_TRACE_STREAM,
+  enforceWholeTraceRetention,
+  finalizeDueTraces,
+  ingestPublicSpanBatch,
+  nextTraceStoreAlarm,
+} from "../domain/public-trace-store";
 
 interface Env {
   ASSETS: Fetcher;
@@ -83,6 +98,12 @@ export default {
       return fetch(env.DEVLOOP_BROWSER_EVENTS_URL, {
         headers: { accept: "text/event-stream" },
       });
+    }
+
+    if (isLoopbackHttpUrl(env.DEVLOOP_BROWSER_EVENTS_URL) &&
+        (url.pathname === "/__devloop/public-spans" || url.pathname === "/__devloop/public-trace-state")) {
+      const internalPath = url.pathname === "/__devloop/public-spans" ? "/public-spans" : "/public-trace-state";
+      return room.fetch(new Request(`https://observability.internal${internalPath}`, request));
     }
 
     if (url.pathname === "/api/stream" || url.pathname === "/api/tail-latency/snapshot") {
@@ -153,12 +174,22 @@ export class TailLatencyRoom extends DurableObject<Env> {
       if (!replayColumns.some((column) => column.name === "oldest_observed_at")) {
         this.ctx.storage.sql.exec("ALTER TABLE replay ADD COLUMN oldest_observed_at INTEGER");
       }
+      initializePublicTraceSchema(cloudflareTraceSql(this.ctx.storage.sql));
     });
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "POST" && url.pathname === "/record") return this.record(request);
+    if (request.method === "POST" && url.pathname === "/public-spans") return this.ingestSpans(request);
+    if (request.method === "GET" && url.pathname === "/public-trace-state") {
+      const store = this.publicTraceStore();
+      return Response.json({
+        counts: store.counts(),
+        nextFinalizeAt: store.nextFinalizeAt(),
+        oldestFirstSeenAt: store.oldestFirstSeenAt(),
+      }, { headers: { "cache-control": "no-store" } });
+    }
     if (request.method === "GET" && url.pathname === "/api/tail-latency/snapshot") return this.snapshot();
     if (request.method === "GET" && url.pathname === "/api/stream") return this.connectWebSocket(request);
     return new Response("Not found", { status: 404 });
@@ -174,6 +205,7 @@ export class TailLatencyRoom extends DurableObject<Env> {
 
   async alarm(): Promise<void> {
     const now = Date.now();
+    this.maintainPublicTraces(now);
     const retention = this.enforceRetention(now);
     const current = this.currentRow();
     const cursor = retainBroadcastCursor(fromCurrentRow(current));
@@ -190,6 +222,24 @@ export class TailLatencyRoom extends DurableObject<Env> {
       if (retention.pointsDeleted > 0) this.persistCurrentProjection(now);
       await this.scheduleNextAlarm(now, action.at);
     }
+  }
+
+  private async ingestSpans(request: Request): Promise<Response> {
+    const parsed = publicSpanBatchSchema.safeParse(await parseRequestJson(request));
+    if (!parsed.success) return new Response("Invalid public span batch", { status: 400 });
+
+    const now = Date.now();
+    const result = this.ctx.storage.transactionSync(() => ingestPublicSpanBatch(
+      PUBLIC_TRACE_STREAM,
+      this.publicTraceStore(),
+      parsed.data,
+      now,
+    ));
+    await this.scheduleNextAlarm(now);
+    return Response.json(result, {
+      headers: { "cache-control": "no-store", "x-content-type-options": "nosniff" },
+      status: 202,
+    });
   }
 
   private async record(request: Request): Promise<Response> {
@@ -373,7 +423,14 @@ export class TailLatencyRoom extends DurableObject<Env> {
       samples.map((sample) => ({ observedAt: sample.observed_at })),
       now,
     );
-    const candidates = [cadenceAt, expiryAt].filter((candidate): candidate is number => candidate !== null);
+    const traceStore = this.publicTraceStore();
+    const traceAlarmAt = nextTraceStoreAlarm(
+      PUBLIC_TRACE_STREAM,
+      traceStore.nextFinalizeAt(),
+      traceStore.oldestFirstSeenAt(),
+    );
+    const candidates = [cadenceAt, expiryAt, traceAlarmAt]
+      .filter((candidate): candidate is number => candidate !== null);
     const scheduledAlarmAt = await this.ctx.storage.getAlarm();
     if (candidates.length === 0) {
       if (scheduledAlarmAt !== null) await this.ctx.storage.deleteAlarm();
@@ -383,6 +440,18 @@ export class TailLatencyRoom extends DurableObject<Env> {
     if (scheduledAlarmAt === null || Math.abs(scheduledAlarmAt - desiredAlarmAt) >= 1) {
       await this.ctx.storage.setAlarm(desiredAlarmAt);
     }
+  }
+
+  private maintainPublicTraces(now: number): void {
+    this.ctx.storage.transactionSync(() => {
+      const store = this.publicTraceStore();
+      finalizeDueTraces(store, now);
+      enforceWholeTraceRetention(PUBLIC_TRACE_STREAM, store, now);
+    });
+  }
+
+  private publicTraceStore(): SqlPublicTraceStore {
+    return new SqlPublicTraceStore(cloudflareTraceSql(this.ctx.storage.sql));
   }
 
   private broadcast(projection: TailLatencyProjection): void {
@@ -466,6 +535,18 @@ function retentionStore(sql: SqlStorage): PublicStreamRetentionStore {
       cutoff,
       now,
     ).rowsWritten,
+  };
+}
+
+function cloudflareTraceSql(sql: SqlStorage): TraceSql {
+  return {
+    exec<Row>(query: string, ...bindings: TraceSqlValue[]): TraceSqlCursor<Row> {
+      const cursor = sql.exec(query, ...bindings);
+      return {
+        rowsWritten: cursor.rowsWritten,
+        toArray: () => cursor.toArray() as Row[],
+      };
+    },
   };
 }
 

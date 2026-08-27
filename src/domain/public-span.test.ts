@@ -4,6 +4,7 @@ import {
   PUBLIC_RUNTIME_SIDES,
   PUBLIC_SPAN_KINDS,
   PUBLIC_SPAN_NAMES,
+  publicSpanBatchSchema,
   publicSpanSchema,
   validateCompleteTrace,
 } from "./public-span";
@@ -64,6 +65,15 @@ describe("public span privacy boundary", () => {
       ...workerRoot,
       attributes: { routeClass: "article", statusClass: "2xx" },
     }).success).toBe(false);
+  });
+
+  it("bounds each intake batch", () => {
+    expect(publicSpanBatchSchema.safeParse([]).success).toBe(false);
+    expect(publicSpanBatchSchema.safeParse([workerRoot]).success).toBe(true);
+    expect(publicSpanBatchSchema.safeParse(Array.from({ length: 32 }, () => workerRoot)).success)
+      .toBe(true);
+    expect(publicSpanBatchSchema.safeParse(Array.from({ length: 33 }, () => workerRoot)).success)
+      .toBe(false);
   });
 });
 
