@@ -51,6 +51,8 @@ npm run check
 ## Documentation
 
 - [Architecture, privacy, and bounds](docs/architecture.md)
+- [Decision: separate runtime and deployment-time metrics](docs/decisions/0001-separate-runtime-and-deployment-metrics.md)
+- [Decision: bounded OpenTelemetry self-observation](docs/decisions/0002-use-bounded-opentelemetry-for-runtime-self-observation.md)
 - [Local development and validation](docs/development.md)
 - [Deployment, Terraform boundary, and cost](docs/deployment.md)
 - [Bitwarden secrets and machine recovery](docs/secrets.md)
