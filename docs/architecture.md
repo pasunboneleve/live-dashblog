@@ -2,14 +2,14 @@
 
 ## Architecture map
 
-The blog has two data planes. Runtime observability measures the public site with joined browser and server [OpenTelemetry](https://opentelemetry.io/) traces while it serves readers. Deployment-time development metrics are fetched and reduced once, then shipped as an immutable static snapshot. They share the Astro publishing path and per-post visualization boundary, but they do not share credentials, persistence, or failure handling.
+The target architecture has two data planes. Runtime observability will measure the public site with joined browser and server [OpenTelemetry](https://opentelemetry.io/) traces while it serves readers. Deployment-time development metrics will be fetched and reduced once, then shipped as an immutable static snapshot. The current vertical slice contains the Worker, static assets, sample-backed tail-latency projection, embedded fallback, browser buffer, and browser-cadence renderer. The target planes share the Astro publishing path and per-post visualization boundary, but they do not share credentials, persistence, or failure handling.
 
 ```mermaid
 flowchart TB
   subgraph delivery["Authoring and deployment"]
     repo["Git repository<br/>Markdown, MDX, and visualization modules"]
-    trigger["Deployment workflow<br/>main push or scheduled refresh"]
-    flow["Appfire Flow<br/>initial development-metrics source"]
+    trigger["Deployment workflow<br/>main push<br/>Planned: scheduled refresh"]
+    flow["Planned: Appfire Flow API or export<br/>development-metrics source"]
     adapter["Planned: source adapter<br/>fetch, validate, aggregate, redact"]
     metrics["Planned: immutable metrics snapshot<br/>schema, source window, generated time"]
     build["Astro build"]
@@ -17,7 +17,8 @@ flowchart TB
 
     repo --> trigger
     trigger --> adapter
-    flow -. "deployment-only credential" .-> adapter
+    flow -->|"fetch source aggregates"| adapter
+    trigger -. "deployment-only Flow credential" .-> adapter
     adapter --> metrics
     repo --> build
     metrics --> build
@@ -27,10 +28,10 @@ flowchart TB
   subgraph edge["Cloudflare runtime"]
     worker["Worker and static assets<br/>serve first, observe second"]
     ingest["Planned: same-origin OTLP intake<br/>sanitize, sample, and shed"]
-    discard["Discard optional telemetry sample"]
+    discard["Planned: discard optional telemetry sample"]
     admission["Planned: trace snapshot and<br/>WebSocket admission gate"]
-    room["SQLite Durable Object<br/>bounded complete traces and replay"]
-    project["Honeycomb-like public projections<br/>aggregates and trace waterfalls"]
+    room["SQLite Durable Object<br/>Planned: bounded complete traces and replay"]
+    project["Planned: Honeycomb-like public projections<br/>aggregates and trace waterfalls"]
 
     deploy --> worker
     worker --> ingest
@@ -41,8 +42,8 @@ flowchart TB
   end
 
   subgraph reader["Reader browser"]
-    article["Article and static metrics snapshot"]
-    otel["Browser OpenTelemetry<br/>page, fetch, and interaction spans"]
+    article["Article"]
+    otel["Planned: browser OpenTelemetry<br/>page, fetch, and interaction spans"]
     fallback["Embedded static observability fallback"]
     buffer["Latest validated projection buffer"]
     render["requestAnimationFrame<br/>persistent keyed DOM and SVG"]
@@ -62,7 +63,7 @@ flowchart TB
   admission -. "limited or unavailable" .-> fallback
 ```
 
-Nodes prefixed with `Planned:` are target architecture, not current implementation. The current vertical slice already contains the Worker, static assets, bounded Durable Object, tail-latency projection, embedded fallback, browser buffer, and browser-cadence renderer. OpenTelemetry instrumentation and intake, trace-shaped persistence, sampling, rate limiting, realtime admission shedding, the development-metrics adapter, and scheduled snapshot refresh remain to be built. The tail-latency slice is a prototype to refactor into span-derived projections, not a second telemetry system to preserve.
+Nodes prefixed with `Planned:` are target architecture, not current implementation. OpenTelemetry instrumentation and intake, trace-shaped persistence, sampling, rate limiting, realtime admission shedding, the development-metrics adapter, and scheduled snapshot refresh remain to be built. The existing bounded Durable Object stores tail-latency samples; the slice is a prototype to refactor into span-derived projections, not a second telemetry system to preserve.
 
 The plane boundary is recorded in [the two-data-plane decision](decisions/0001-separate-runtime-and-deployment-metrics.md). [The bounded OpenTelemetry decision](decisions/0002-use-bounded-opentelemetry-for-runtime-self-observation.md) records the distributed-trace join, persistence, and recursion cutoff. The development plane deliberately keeps its source replaceable: [Appfire Flow](https://appfire.com/flow/info) is scheduled for retirement on 31 December 2027, although Appfire says existing API functionality remains available during the supported period.
 
@@ -136,10 +137,9 @@ Each post owns its explanatory prose and purpose-built visualization. Runtime pr
 
 - WebSocket handlers: may parse, enqueue, or store projections; must not redraw the UI directly.
 - Rendering: browser-cadence rendering with coalesced updates.
-- Keep token, log, retrieval, recent-change, and projection collections bounded.
-- Bounds: token, log, retrieval, recent-change, error, timeline, and projection collections stay bounded.
-- Mock streams: realistic pacing, burst mode, retries, failed-tool cases, retrieval-heavy cases, duplicate events, and out-of-order events.
-- Tests: deterministic reducer/projection tests plus rendered-page inspection under streaming load.
+- Storage collections: `samples`, `replay`, and `current_projection` stay within the declared presentation window and row caps.
+- Genuine timing validation: exercise actual Worker requests, including bursts, retries, duplicate projections, and out-of-order projections; do not invent telemetry activity for the public view.
+- Tests: deterministic reducer/projection tests, actual SQLite row-count tests, and rendered-page inspection under streaming load.
 - Required flow: `event stream -> reducer/domain core -> bounded projection -> latest projection buffer -> requestAnimationFrame render loop -> keyed/persistent SVG/DOM updates`.
 - Every public stream declares one presentation window; raw rows, projections, replay, snapshots, and rendering enforce that same window.
 
