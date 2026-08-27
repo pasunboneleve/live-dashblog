@@ -28,8 +28,8 @@ flowchart TB
   subgraph edge["Cloudflare runtime"]
     worker["Worker and static assets<br/>serve first, observe second"]
     ingest["Same-origin OTLP intake<br/>sanitize and require trace admission"]
-    discard["Planned: shed optional telemetry<br/>at the launch cost ceiling"]
-    admission["Worker-issued trace admission<br/>Planned: WebSocket connection ceiling"]
+    discard["Shed optional telemetry<br/>at the launch cost ceiling"]
+    admission["Worker-issued trace admission<br/>bounded snapshots and WebSockets"]
     room["SQLite Durable Object<br/>bounded complete traces and replay"]
     project["Honeycomb-like public projection<br/>aggregates, heatmap, and waterfalls"]
 
@@ -63,7 +63,7 @@ flowchart TB
   admission -. "limited or unavailable" .-> fallback
 ```
 
-Nodes prefixed with `Planned:` remain unimplemented. The runtime plane now instruments the article, joins browser, Worker, and Durable Object spans, rejects telemetry outside the public schema, assembles complete traces, derives bounded projections, replays them over one hibernating WebSocket, and renders the aggregates and waterfall at browser cadence. Launch-grade sampling, complete dropped-trace accounting, a WebSocket connection ceiling, the development-metrics adapter, and scheduled snapshot refresh remain open. The older tail-latency article and tables remain a separate prototype until its removal is validated; the observability post no longer reads them.
+Nodes prefixed with `Planned:` remain unimplemented. The runtime plane now instruments the article, joins browser, Worker, and Durable Object spans, rejects telemetry outside the public schema, sheds optional work at explicit request and connection ceilings, assembles complete traces, derives bounded projections, replays them over one hibernating WebSocket, and renders the aggregates and waterfall at browser cadence. The development-metrics adapter and scheduled snapshot refresh remain open. The older tail-latency article and tables remain a separate prototype until its removal is validated; the observability post no longer reads them.
 
 The plane boundary is recorded in [the two-data-plane decision](decisions/0001-separate-runtime-and-deployment-metrics.md). [The bounded OpenTelemetry decision](decisions/0002-use-bounded-opentelemetry-for-runtime-self-observation.md) records the distributed-trace join, persistence, and recursion cutoff. The development plane deliberately keeps its source replaceable: [Appfire Flow](https://appfire.com/flow/info) is scheduled for retirement on 31 December 2027, although Appfire says existing API functionality remains available during the supported period.
 
@@ -113,7 +113,9 @@ The viral-load contract is therefore:
 - browsers coalesce projections at paint cadence;
 - live-data failure degrades to a labeled static or last-valid view.
 
-The current trace admission prevents arbitrary trace injection and bounds uploads from each admitted page. Launch traffic shedding still needs a root sampler, complete drop accounting, and a WebSocket connection ceiling. Static content must continue to serve when those optional telemetry gates reject work.
+The root sampler admits the first ten eligible article traces in each one-second window while preserving 100% sampling at ordinary low traffic. It retains at most 120 active admission tokens. Each admitted trace may send eight browser batches of no more than 64 KiB, while the shared intake accepts at most 40 valid batches per second. Snapshots admit 30 requests per second. WebSocket admission permits ten successful handshakes per second and 64 simultaneous public sockets across both streams. A rejected optional operation receives `429` with `Retry-After`; article HTML still serves with its embedded fallback when admission is denied or the Durable Object is unavailable.
+
+Four singleton fixed-window rows persist these request counters across hibernation without an unbounded request log. Sampling decisions use separate five-second buckets, capped at 61 rows and five minutes. Accepted roots are exact up to the ten-per-second ceiling. Once a root window is exhausted, the budget row records only its first rejection; later rejects in that window perform no telemetry write. The public view therefore marks the displayed admission percentage as an upper bound and the dropped count as a lower bound whenever any shedding occurred. Invalid and oversized traces contribute to the dropped lower bound but do not distort the root-sampling numerator.
 
 The OpenTelemetry JavaScript browser packages remain experimental even though the underlying tracing API is stable. Browser instrumentation therefore stays behind a narrow adapter with deterministic fixtures, so package changes do not leak into article code or the public span schema.
 
@@ -162,6 +164,8 @@ The storage bounds are:
 - `observability_projection_state`: exactly zero or one row;
 - `observability_projection_replay`: at most 61 rows in the same five-minute window;
 - `browser_trace_admissions`: at most 120 active rows, each expiring with the presentation window.
+- `public_request_budgets`: exactly zero to four singleton window rows;
+- `observability_sampling_buckets`: at most 61 five-second rows in the presentation window.
 
 ## One presentation window
 

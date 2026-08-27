@@ -39,7 +39,7 @@ describe("bounded observability projection replay", () => {
       store.publish(projectPublicObservability([JOINED_PUBLIC_TRACE], sequence, 10_000 + sequence));
     }
 
-    expect(store.counts()).toEqual({ current: 1, dropBuckets: 0, replay: 3 });
+    expect(store.counts()).toEqual({ current: 1, dropBuckets: 0, replay: 3, samplingBuckets: 0 });
     expect(store.readCurrent()?.sequence).toBe(3);
     expect(store.oldestReplaySequence()).toBe(1);
     expect(store.nextExpiryAt()).toBe(10_001 + PUBLIC_TRACE_STREAM.presentationDurationMs + 1);
@@ -53,11 +53,11 @@ describe("bounded observability projection replay", () => {
     for (let sequence = 1; sequence <= 6; sequence += 1) {
       bounded.publish(projectPublicObservability([JOINED_PUBLIC_TRACE], sequence, 20_000 + sequence));
     }
-    expect(bounded.counts()).toEqual({ current: 1, dropBuckets: 0, replay: 3 });
+    expect(bounded.counts()).toEqual({ current: 1, dropBuckets: 0, replay: 3, samplingBuckets: 0 });
     expect(bounded.replayAfter(0)?.map((projection) => projection.sequence)).toEqual([4, 5, 6]);
 
     bounded.enforceRetention(20_020);
-    expect(bounded.counts()).toEqual({ current: 1, dropBuckets: 0, replay: 0 });
+    expect(bounded.counts()).toEqual({ current: 1, dropBuckets: 0, replay: 0, samplingBuckets: 0 });
   });
 
   it("persists dirty cadence state and fails corrupt replay closed across restart", () => {
@@ -87,6 +87,32 @@ describe("bounded observability projection replay", () => {
     expect(bounded.nextDropExpiryAt()).toBe(60_005);
     expect(bounded.droppedTraceCount(65_000)).toBe(4);
     expect(bounded.counts().dropBuckets).toBe(1);
+  });
+
+  it("reports and expires the root sampling rate independently from invalid traces", () => {
+    const { sql } = createStore();
+    const stream = { ...PUBLIC_TRACE_STREAM, presentationDurationMs: 20_000, replayLimit: 3 };
+    const bounded = new SqlPublicObservabilityStore(sql, stream);
+    bounded.recordSamplingDecision(40_001, true);
+    bounded.recordSamplingDecision(40_002, true);
+    bounded.recordSamplingDecision(40_003, false);
+    bounded.recordDroppedTraces(40_004, 5);
+
+    expect(bounded.samplingWindow(40_004)).toEqual({
+      admittedTraceCount: 2,
+      sampleRate: 2 / 3,
+      sampledOutTraceCount: 1,
+    });
+    expect(bounded.counts().samplingBuckets).toBe(1);
+    expect(bounded.nextExpiryAt()).toBe(60_004);
+    expect(bounded.nextSamplingExpiryAt()).toBe(60_004);
+
+    expect(bounded.samplingWindow(60_004)).toEqual({
+      admittedTraceCount: 0,
+      sampleRate: 1,
+      sampledOutTraceCount: 0,
+    });
+    expect(bounded.counts().samplingBuckets).toBe(0);
   });
 });
 

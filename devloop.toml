@@ -32,7 +32,9 @@ paths = [
   "src/domain/public-stream.ts",
   "src/domain/public-observability-sql.ts",
   "src/domain/public-observability.ts",
+  "src/domain/public-request-budget-sql.ts",
   "src/domain/public-span.ts",
+  "src/domain/public-telemetry-budget.ts",
   "src/domain/fixtures/public-spans.ts",
   "src/domain/public-trace-sql.ts",
   "src/domain/public-trace-store.ts",
@@ -47,7 +49,11 @@ paths = [
 workflow = "site_changed"
 
 [watch.worker]
-paths = ["src/worker/index.ts"]
+paths = [
+  "src/worker/index.ts",
+  "src/worker/public-intake-response.ts",
+  "src/worker/public-runtime-span-policy.ts",
+]
 workflow = "worker_changed"
 
 [watch.worker_config]

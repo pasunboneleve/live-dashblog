@@ -61,4 +61,4 @@ npm run check
 
 ## Status
 
-The Cloudflare scaffold is live on workers.dev, while the recursive observability implementation is currently validated locally and awaits its normal review and deployment path. Launch traffic shedding, cost notifications, the complete production smoke test, and the deployment-time development-metrics post remain open.
+The Cloudflare scaffold is live on workers.dev, while the recursive observability implementation and its launch traffic ceilings are currently validated locally and await their normal review and deployment path. Cost notifications, the complete production smoke test, and the deployment-time development-metrics post remain open.

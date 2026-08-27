@@ -1,4 +1,5 @@
 import { type PublicSpan, validateCompleteTrace } from "./public-span";
+import { PUBLIC_TELEMETRY_BUDGET } from "./public-telemetry-budget";
 
 export interface PublicTraceStreamDefinition {
   assemblyGraceMs: number;
@@ -16,7 +17,7 @@ export const PUBLIC_TRACE_STREAM: PublicTraceStreamDefinition = Object.freeze({
   broadcastIntervalMs: 5_000,
   maxSpansPerTrace: 16,
   maxTotalSpans: 960,
-  maxTraces: 120,
+  maxTraces: PUBLIC_TELEMETRY_BUDGET.rootTraces.maxActive,
   name: "observability",
   presentationDurationMs: 5 * 60_000,
   replayLimit: 61,

@@ -25,6 +25,11 @@ interface CountRow {
   count: number;
 }
 
+interface SamplingRow {
+  admitted: number;
+  sampled_out: number;
+}
+
 interface DeadlineRow {
   deadline: number | null;
 }
@@ -37,6 +42,13 @@ export interface ObservabilityProjectionCounts {
   current: number;
   dropBuckets: number;
   replay: number;
+  samplingBuckets: number;
+}
+
+export interface PublicSamplingWindow {
+  admittedTraceCount: number;
+  sampleRate: number;
+  sampledOutTraceCount: number;
 }
 
 /** Creates the bounded current-projection and replay tables without storing another raw trace copy. */
@@ -61,6 +73,12 @@ export function initializePublicObservabilitySchema(sql: TraceSql): void {
       bucket_at INTEGER PRIMARY KEY,
       latest_event_at INTEGER NOT NULL,
       dropped_trace_count INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS observability_sampling_buckets (
+      bucket_at INTEGER PRIMARY KEY,
+      latest_event_at INTEGER NOT NULL,
+      admitted_trace_count INTEGER NOT NULL,
+      sampled_out_trace_count INTEGER NOT NULL
     );
   `);
   const dropColumns = sql.exec<ColumnRow>(
@@ -145,7 +163,11 @@ export class SqlPublicObservabilityStore {
     return sequence === null || sequence === undefined ? null : Number(sequence);
   }
 
-  enforceRetention(now: number): { dropBucketsDeleted: number; replayDeleted: number } {
+  enforceRetention(now: number): {
+    dropBucketsDeleted: number;
+    replayDeleted: number;
+    samplingBucketsDeleted: number;
+  } {
     const replayOutside = this.sql.exec(
       "DELETE FROM observability_projection_replay WHERE generated_at < ? OR generated_at > ?",
       now - this.stream.presentationDurationMs,
@@ -161,6 +183,40 @@ export class SqlPublicObservabilityStore {
     return {
       dropBucketsDeleted: this.enforceDropRetention(now),
       replayDeleted: replayOutside + replayBeyond,
+      samplingBucketsDeleted: this.enforceSamplingRetention(now),
+    };
+  }
+
+  recordSamplingDecision(now: number, admitted: boolean): void {
+    const bucketAt = Math.floor(now / this.stream.broadcastIntervalMs)
+      * this.stream.broadcastIntervalMs;
+    this.sql.exec(`
+      INSERT INTO observability_sampling_buckets
+        (bucket_at, latest_event_at, admitted_trace_count, sampled_out_trace_count)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(bucket_at) DO UPDATE SET
+        latest_event_at = MAX(latest_event_at, excluded.latest_event_at),
+        admitted_trace_count = admitted_trace_count + excluded.admitted_trace_count,
+        sampled_out_trace_count = sampled_out_trace_count + excluded.sampled_out_trace_count
+    `, bucketAt, now, admitted ? 1 : 0, admitted ? 0 : 1);
+    this.enforceRetention(now);
+  }
+
+  samplingWindow(now: number): PublicSamplingWindow {
+    this.enforceRetention(now);
+    const row = this.sql.exec<SamplingRow>(`
+      SELECT
+        COALESCE(SUM(admitted_trace_count), 0) AS admitted,
+        COALESCE(SUM(sampled_out_trace_count), 0) AS sampled_out
+      FROM observability_sampling_buckets
+    `).toArray()[0];
+    const admittedTraceCount = Number(row?.admitted ?? 0);
+    const sampledOutTraceCount = Number(row?.sampled_out ?? 0);
+    const decisions = admittedTraceCount + sampledOutTraceCount;
+    return {
+      admittedTraceCount,
+      sampleRate: decisions === 0 ? 1 : admittedTraceCount / decisions,
+      sampledOutTraceCount,
     };
   }
 
@@ -191,7 +247,8 @@ export class SqlPublicObservabilityStore {
       "SELECT MIN(generated_at) AS deadline FROM observability_projection_replay",
     ).toArray()[0]?.deadline;
     const dropAt = this.oldestDropEventAt();
-    const oldest = [replayAt, dropAt]
+    const samplingAt = this.oldestSamplingEventAt();
+    const oldest = [replayAt, dropAt, samplingAt]
       .filter((value): value is number => value !== null && value !== undefined);
     return oldest.length === 0
       ? null
@@ -200,6 +257,11 @@ export class SqlPublicObservabilityStore {
 
   nextDropExpiryAt(): number | null {
     const oldest = this.oldestDropEventAt();
+    return oldest === null ? null : oldest + this.stream.presentationDurationMs + 1;
+  }
+
+  nextSamplingExpiryAt(): number | null {
+    const oldest = this.oldestSamplingEventAt();
     return oldest === null ? null : oldest + this.stream.presentationDurationMs + 1;
   }
 
@@ -213,7 +275,15 @@ export class SqlPublicObservabilityStore {
     const dropBuckets = this.sql.exec<CountRow>(
       "SELECT COUNT(*) AS count FROM observability_drop_buckets",
     ).toArray()[0]?.count ?? 0;
-    return { current: Number(current), dropBuckets: Number(dropBuckets), replay: Number(replay) };
+    const samplingBuckets = this.sql.exec<CountRow>(
+      "SELECT COUNT(*) AS count FROM observability_sampling_buckets",
+    ).toArray()[0]?.count ?? 0;
+    return {
+      current: Number(current),
+      dropBuckets: Number(dropBuckets),
+      replay: Number(replay),
+      samplingBuckets: Number(samplingBuckets),
+    };
   }
 
   private state(): ProjectionStateRow | undefined {
@@ -242,6 +312,29 @@ export class SqlPublicObservabilityStore {
   private oldestDropEventAt(): number | null {
     const value = this.sql.exec<DeadlineRow>(
       "SELECT MIN(latest_event_at) AS deadline FROM observability_drop_buckets",
+    ).toArray()[0]?.deadline;
+    return value === null || value === undefined ? null : Number(value);
+  }
+
+  private enforceSamplingRetention(now: number): number {
+    const outside = this.sql.exec(
+      "DELETE FROM observability_sampling_buckets WHERE latest_event_at < ? OR latest_event_at > ?",
+      now - this.stream.presentationDurationMs,
+      now,
+    ).rowsWritten;
+    const beyond = this.sql.exec(`
+      DELETE FROM observability_sampling_buckets
+      WHERE bucket_at NOT IN (
+        SELECT bucket_at FROM observability_sampling_buckets
+        ORDER BY bucket_at DESC LIMIT ?
+      )
+    `, this.stream.replayLimit).rowsWritten;
+    return outside + beyond;
+  }
+
+  private oldestSamplingEventAt(): number | null {
+    const value = this.sql.exec<DeadlineRow>(
+      "SELECT MIN(latest_event_at) AS deadline FROM observability_sampling_buckets",
     ).toArray()[0]?.deadline;
     return value === null || value === undefined ? null : Number(value);
   }

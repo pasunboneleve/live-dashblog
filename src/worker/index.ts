@@ -58,12 +58,22 @@ import {
 import {
   PUBLIC_TRACE_ADMISSION_BATCH_LIMIT,
   PUBLIC_TRACE_ADMISSION_HEADER,
-  PUBLIC_TRACE_ADMISSION_RATE_LIMIT,
-  PUBLIC_TRACE_ADMISSION_RATE_WINDOW_MS,
   PUBLIC_TRACE_ADMISSION_TTL_MS,
   admissionMatchesBatch,
   publicTraceAdmissionSchema,
 } from "../domain/public-trace-admission";
+import {
+  PUBLIC_TELEMETRY_BUDGET,
+  hasPublicWebSocketCapacity,
+  retryAfterSeconds,
+  type FixedWindowBudget,
+} from "../domain/public-telemetry-budget";
+import {
+  SqlPublicRequestBudgetStore,
+  initializePublicRequestBudgetSchema,
+} from "../domain/public-request-budget-sql";
+import { publicIntakeStorageFailure } from "./public-intake-response";
+import { shouldRecordPublicRuntimeSpan } from "./public-runtime-span-policy";
 
 interface Env {
   ASSETS: Fetcher;
@@ -232,6 +242,7 @@ export class TailLatencyRoom extends DurableObject<Env> {
       }
       initializePublicTraceSchema(cloudflareTraceSql(this.ctx.storage.sql));
       initializePublicObservabilitySchema(cloudflareTraceSql(this.ctx.storage.sql));
+      initializePublicRequestBudgetSchema(cloudflareTraceSql(this.ctx.storage.sql));
       this.ctx.storage.sql.exec(`
         CREATE TABLE IF NOT EXISTS browser_trace_admissions (
           token TEXT PRIMARY KEY,
@@ -288,7 +299,9 @@ export class TailLatencyRoom extends DurableObject<Env> {
     const now = Date.now();
     const observability = this.publicObservabilityStore();
     if (this.maintainPublicTraces(now)) observability.markDirty();
-    if (observability.enforceRetention(now).dropBucketsDeleted > 0) observability.markDirty();
+    const observabilityRetention = observability.enforceRetention(now);
+    if (observabilityRetention.dropBucketsDeleted > 0 ||
+        observabilityRetention.samplingBucketsDeleted > 0) observability.markDirty();
     this.publishObservabilityIfDue(now);
     const retention = this.enforceRetention(now);
     const current = this.currentRow();
@@ -333,25 +346,36 @@ export class TailLatencyRoom extends DurableObject<Env> {
     if (!token || !parsed.success) return new Response("Invalid browser span batch", { status: 400 });
 
     const now = Date.now();
-    const result = this.ctx.storage.transactionSync(() => {
+    const outcome = this.ctx.storage.transactionSync(() => {
       this.deleteExpiredAdmissions(now);
       const admission = this.ctx.storage.sql.exec<TraceAdmissionRow>(`
         SELECT trace_id, expires_at, remaining_batches
         FROM browser_trace_admissions WHERE token = ?
       `, token).toArray()[0];
       if (!admission || admission.expires_at < now || admission.remaining_batches <= 0 ||
-          !admissionMatchesBatch(admission.trace_id, parsed.data)) return null;
+          !admissionMatchesBatch(admission.trace_id, parsed.data)) return { kind: "rejected" } as const;
+      if (!this.publicRequestBudgetStore().tryConsume(
+        "intake",
+        PUBLIC_TELEMETRY_BUDGET.intake.requests,
+        now,
+      )) return { kind: "shed" } as const;
       this.ctx.storage.sql.exec(`
         UPDATE browser_trace_admissions
         SET remaining_batches = remaining_batches - 1
         WHERE token = ?
       `, token);
-      return ingestPublicSpanBatch(PUBLIC_TRACE_STREAM, this.publicTraceStore(), parsed.data, now);
+      return {
+        kind: "stored",
+        result: ingestPublicSpanBatch(PUBLIC_TRACE_STREAM, this.publicTraceStore(), parsed.data, now),
+      } as const;
     });
-    if (result === null) return new Response("Trace admission rejected", { status: 403 });
-    this.recordObservabilityIngestResult(result, now);
+    if (outcome.kind === "rejected") return new Response("Trace admission rejected", { status: 403 });
+    if (outcome.kind === "shed") {
+      return budgetExceededResponse(now, PUBLIC_TELEMETRY_BUDGET.intake.requests);
+    }
+    this.recordObservabilityIngestResult(outcome.result, now);
     await this.scheduleNextAlarm(now);
-    return Response.json(result, {
+    return Response.json(outcome.result, {
       headers: { "cache-control": "no-store", "x-content-type-options": "nosniff" },
       status: 202,
     });
@@ -362,16 +386,26 @@ export class TailLatencyRoom extends DurableObject<Env> {
     if (!parsed.success) return new Response("Invalid trace admission", { status: 400 });
 
     const now = Date.now();
-    const issued = this.ctx.storage.transactionSync(() => {
+    const decision = this.ctx.storage.transactionSync(() => {
       this.deleteExpiredAdmissions(now);
-      const recentlyIssued = Number(this.ctx.storage.sql.exec<CountValueRow>(`
-        SELECT COUNT(*) AS count FROM browser_trace_admissions WHERE issued_at >= ?
-      `, now - PUBLIC_TRACE_ADMISSION_RATE_WINDOW_MS).toArray()[0]?.count ?? 0);
       const active = Number(this.ctx.storage.sql.exec<CountValueRow>(`
         SELECT COUNT(*) AS count FROM browser_trace_admissions
       `).toArray()[0]?.count ?? 0);
-      if (recentlyIssued >= PUBLIC_TRACE_ADMISSION_RATE_LIMIT || active >= PUBLIC_TRACE_STREAM.maxTraces) {
-        return false;
+      const budgets = this.publicRequestBudgetStore();
+      if (active >= PUBLIC_TELEMETRY_BUDGET.rootTraces.maxActive ||
+          !budgets.tryConsume(
+            "root-trace",
+            PUBLIC_TELEMETRY_BUDGET.rootTraces.requests,
+            now,
+          )) {
+        return {
+          issued: false,
+          recordRejection: budgets.recordRejectionOnce(
+            "root-trace",
+            PUBLIC_TELEMETRY_BUDGET.rootTraces.requests,
+            now,
+          ),
+        };
       }
       this.ctx.storage.sql.exec(`
         INSERT INTO browser_trace_admissions
@@ -379,17 +413,24 @@ export class TailLatencyRoom extends DurableObject<Env> {
         VALUES (?, ?, ?, ?, ?)
       `, parsed.data.token, parsed.data.traceId, now, now + PUBLIC_TRACE_ADMISSION_TTL_MS,
       PUBLIC_TRACE_ADMISSION_BATCH_LIMIT);
-      return true;
+      return { issued: true, recordRejection: false };
     });
-    if (!issued) {
-      const observability = this.publicObservabilityStore();
+    const observability = this.publicObservabilityStore();
+    if (decision.issued) {
+      observability.recordSamplingDecision(now, true);
+      observability.markDirty();
+      await this.scheduleNextAlarm(now);
+    } else if (decision.recordRejection) {
+      observability.recordSamplingDecision(now, false);
       observability.recordDroppedTraces(now);
       observability.markDirty();
       await this.scheduleNextAlarm(now);
     }
     return new Response(null, {
-      headers: { "cache-control": "no-store" },
-      status: issued ? 201 : 429,
+      headers: decision.issued
+        ? { "cache-control": "no-store" }
+        : budgetExceededHeaders(now, PUBLIC_TELEMETRY_BUDGET.rootTraces.requests),
+      status: decision.issued ? 201 : 429,
     });
   }
 
@@ -398,6 +439,12 @@ export class TailLatencyRoom extends DurableObject<Env> {
   }
 
   private async traceSnapshot(request: Request): Promise<Response> {
+    const now = Date.now();
+    if (!this.publicRequestBudgetStore().tryConsume(
+      "snapshot",
+      PUBLIC_TELEMETRY_BUDGET.snapshots.requests,
+      now,
+    )) return budgetExceededResponse(now, PUBLIC_TELEMETRY_BUDGET.snapshots.requests);
     return tracing.enterSpan("durable-object.snapshot", async (nativeSpan) => {
       nativeSpan.setAttribute("app.telemetry.operation_class", "snapshot");
       const started = startPublicSpan(request.headers.get("traceparent"), Date.now());
@@ -419,12 +466,14 @@ export class TailLatencyRoom extends DurableObject<Env> {
       nativeSpan.setAttribute("app.telemetry.operation_class", "stream-connect");
       const started = startPublicSpan(request.headers.get("traceparent"), Date.now());
       const response = await this.connectWebSocket(request);
-      await this.recordRuntimeSpan(finishDurableObjectSpan(
-        "stream-connect",
-        started,
-        response.status,
-        Date.now(),
-      ));
+      if (shouldRecordPublicRuntimeSpan(response.status)) {
+        await this.recordRuntimeSpan(finishDurableObjectSpan(
+          "stream-connect",
+          started,
+          response.status,
+          Date.now(),
+        ));
+      }
       return response;
     });
   }
@@ -577,6 +626,13 @@ export class TailLatencyRoom extends DurableObject<Env> {
     if (streams.length !== 1 || (stream !== STREAM_NAME && stream !== OBSERVABILITY_STREAM_NAME)) {
       return new Response("Unknown or disallowed public stream", { status: 400 });
     }
+    const now = Date.now();
+    if (!hasPublicWebSocketCapacity(this.ctx.getWebSockets().length) ||
+        !this.publicRequestBudgetStore().tryConsume(
+          "websocket",
+          PUBLIC_TELEMETRY_BUDGET.webSockets.requests,
+          now,
+        )) return budgetExceededResponse(now, PUBLIC_TELEMETRY_BUDGET.webSockets.requests);
     if (stream === OBSERVABILITY_STREAM_NAME) await this.refreshObservabilityForRead(Date.now());
     else await this.refreshForRead(Date.now());
 
@@ -629,7 +685,8 @@ export class TailLatencyRoom extends DurableObject<Env> {
   private async refreshObservabilityForRead(now: number): Promise<void> {
     const store = this.publicObservabilityStore();
     if (this.maintainPublicTraces(now)) store.markDirty();
-    if (store.enforceRetention(now).dropBucketsDeleted > 0) store.markDirty();
+    const retention = store.enforceRetention(now);
+    if (retention.dropBucketsDeleted > 0 || retention.samplingBucketsDeleted > 0) store.markDirty();
     const currentMissing = store.readCurrent() === null;
     if (currentMissing) store.markDirty();
     const publishAt = store.nextPublishAt(now);
@@ -724,6 +781,10 @@ export class TailLatencyRoom extends DurableObject<Env> {
     );
   }
 
+  private publicRequestBudgetStore(): SqlPublicRequestBudgetStore {
+    return new SqlPublicRequestBudgetStore(cloudflareTraceSql(this.ctx.storage.sql));
+  }
+
   private publishObservabilityIfDue(now: number): void {
     const publishAt = this.publicObservabilityStore().nextPublishAt(now);
     if (publishAt !== null && publishAt <= now) this.publishObservability(now);
@@ -731,6 +792,7 @@ export class TailLatencyRoom extends DurableObject<Env> {
 
   private publishObservability(now: number): void {
     const store = this.publicObservabilityStore();
+    const sampling = store.samplingWindow(now);
     const projection = projectPublicObservability(
       this.publicTraceStore().readFinalizedTraces(),
       store.nextSequence(),
@@ -738,7 +800,8 @@ export class TailLatencyRoom extends DurableObject<Env> {
       {
         droppedTraceCount: store.droppedTraceCount(now),
         droppedTraceExpiresAtUnixMs: store.nextDropExpiryAt(),
-        sampleRate: 1,
+        sampleRate: sampling.sampleRate,
+        samplingExpiresAtUnixMs: store.nextSamplingExpiryAt(),
       },
     );
     this.ctx.storage.transactionSync(() => store.publish(projection));
@@ -876,10 +939,12 @@ async function tracePublicApiRequest(
     const started = startPublicSpan(browserParent, Date.now());
     const response = await room.fetch(withTraceparent(request, started.traceparent, operation === "stream"));
     nativeSpan.setAttribute("http.response.status_code", response.status);
-    context.waitUntil(recordPublicRuntimeSpan(
-      room,
-      finishWorkerSpan(operation, started, response.status, Date.now()),
-    ));
+    if (shouldRecordPublicRuntimeSpan(response.status)) {
+      context.waitUntil(recordPublicRuntimeSpan(
+        room,
+        finishWorkerSpan(operation, started, response.status, Date.now()),
+      ));
+    }
     return response;
   });
 }
@@ -891,7 +956,7 @@ async function ingestPublicOtlpRequest(
   if (request.headers.get("content-type")?.split(";", 1)[0] !== "application/json") {
     return new Response("Expected OTLP/HTTP JSON", { status: 415 });
   }
-  const payload = await readBoundedJson(request, 64 * 1024);
+  const payload = await readBoundedJson(request, PUBLIC_TELEMETRY_BUDGET.intake.maxPayloadBytes);
   if (payload === null) return new Response("Invalid or oversized OTLP payload", { status: 400 });
   const spans = parsePublicOtlpJson(payload);
   if (spans === null) return new Response("Disallowed OTLP span batch", { status: 400 });
@@ -899,8 +964,8 @@ async function ingestPublicOtlpRequest(
   if (!admissionToken) return new Response("Missing trace admission", { status: 403 });
 
   const stored = await recordPublicBrowserSpans(room, admissionToken, spans);
-  if (stored.status === 403) return new Response("Trace admission rejected", { status: 403 });
-  if (!stored.ok) return new Response("Telemetry storage unavailable", { status: 503 });
+  const storageFailure = publicIntakeStorageFailure(stored);
+  if (storageFailure) return storageFailure;
   return Response.json({}, {
     headers: { "cache-control": "no-store", "x-content-type-options": "nosniff" },
   });
@@ -923,11 +988,16 @@ async function traceArticleRequest(
 
     if (publicStarted) {
       const admissionToken = crypto.randomUUID().replaceAll("-", "");
-      const admitted = await issueBrowserTraceAdmission(
-        room,
-        admissionToken,
-        publicStarted.context.traceId,
-      );
+      let admitted = false;
+      try {
+        admitted = await issueBrowserTraceAdmission(
+          room,
+          admissionToken,
+          publicStarted.context.traceId,
+        );
+      } catch {
+        // Telemetry is optional; the static article and embedded fallback remain primary.
+      }
       if (admitted) {
         response = injectBrowserTraceContext(response, publicStarted.traceparent, admissionToken);
         context.waitUntil(recordPublicRuntimeSpan(
@@ -1086,6 +1156,20 @@ function parseSequence(raw: string | null): number {
 
 function parseStoredJson(payload: string): unknown {
   try { return JSON.parse(payload) as unknown; } catch { return null; }
+}
+
+function budgetExceededResponse(now: number, budget: FixedWindowBudget): Response {
+  return new Response("Optional telemetry budget reached", {
+    headers: budgetExceededHeaders(now, budget),
+    status: 429,
+  });
+}
+
+function budgetExceededHeaders(now: number, budget: FixedWindowBudget): HeadersInit {
+  return {
+    "cache-control": "no-store",
+    "retry-after": String(retryAfterSeconds(now, budget)),
+  };
 }
 
 async function parseRequestJson(request: Request): Promise<unknown> {

@@ -81,6 +81,7 @@ interface ProjectionSampling {
   droppedTraceExpiresAtUnixMs?: number | null;
   droppedTraceCount: number;
   sampleRate: number;
+  samplingExpiresAtUnixMs?: number | null;
 }
 
 const HEATMAP_EDGES_MS = Object.freeze([0, 5, 10, 25, 50, 100, 250, 500, 1_000, 5_000, 60_001]);
@@ -100,7 +101,11 @@ export function projectPublicObservability(
       Math.min(...trace.map((span) => span.startedAtUnixMs))
       + PUBLIC_TRACE_STREAM.presentationDurationMs + 1
     ));
-  const expiryCandidates = [traceExpiryAt, sampling.droppedTraceExpiresAtUnixMs]
+  const expiryCandidates = [
+    traceExpiryAt,
+    sampling.droppedTraceExpiresAtUnixMs,
+    sampling.samplingExpiresAtUnixMs,
+  ]
     .filter((value): value is number => value !== null && value !== undefined);
   return publicObservabilityProjectionSchema.parse({
     aggregates: {

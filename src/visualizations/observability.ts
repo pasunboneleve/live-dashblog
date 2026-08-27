@@ -51,7 +51,11 @@ export function mountObservability(root: HTMLElement): void {
     setText("[data-p95]", `${formatMilliseconds(current.aggregates.overall.p95Ms)} ms`);
     setText("[data-max]", `${formatMilliseconds(current.aggregates.overall.maxMs)} ms`);
     setText("[data-sequence]", current.sequence === 0 ? "embedded trace" : `live · sequence ${current.sequence}`);
-    setText("[data-sampling]", `${formatPercent(current.sampling.sampleRate)} admitted · ${current.sampling.droppedTraceCount} dropped`);
+    const bounded = current.sampling.droppedTraceCount > 0;
+    setText(
+      "[data-sampling]",
+      `${bounded ? "≤" : ""}${formatPercent(current.sampling.sampleRate)} admitted · ${bounded ? "≥" : ""}${current.sampling.droppedTraceCount} dropped`,
+    );
     renderRuntimeGroups();
     renderHeatmap();
     renderTraceChoices();

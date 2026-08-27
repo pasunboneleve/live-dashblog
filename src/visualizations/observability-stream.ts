@@ -119,7 +119,7 @@ function scheduleExpiry(projection: PublicObservabilityProjection): void {
   expiryTimer = window.setTimeout(() => {
     latest = projectPublicObservability([], projection.sequence, expiryAt, {
       droppedTraceCount: 0,
-      sampleRate: projection.sampling.sampleRate,
+      sampleRate: 1,
     });
     scheduleRender();
   }, Math.max(0, expiryAt - Date.now()));

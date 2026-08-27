@@ -42,13 +42,14 @@ describe("public observability projection", () => {
     const projection = projectPublicObservability([], 9, 1_800_000_001_000, {
       droppedTraceCount: 3,
       sampleRate: 0.5,
+      samplingExpiresAtUnixMs: 1_800_000_002_000,
     });
 
     expect(projection).toMatchObject({
       aggregates: { overall: { count: 0, errorRate: 0, maxMs: 0, p50Ms: 0, p95Ms: 0 } },
       heatmap: expect.arrayContaining([expect.objectContaining({ count: 0 })]),
       sampling: { admittedTraceCount: 0, droppedTraceCount: 3, sampleRate: 0.5 },
-      dataExpiresAtUnixMs: null,
+      dataExpiresAtUnixMs: 1_800_000_002_000,
       slowTraces: [],
       spanCount: 0,
       traceCount: 0,

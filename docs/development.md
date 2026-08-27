@@ -48,6 +48,8 @@ for request in {1..8}; do curl --silent --output /dev/null http://localhost:8787
 
 The live sequence may advance once, not eight times, during one five-second interval. Scroll until the dashboard is more than the observer’s 300-pixel margin outside the viewport, issue another request after the cadence interval, then return. Going off-screen or hiding the page must close the socket. Returning opens one page-level socket with `streams=observability&since=<last sequence>`; success means the dashboard receives later replay or the current snapshot without duplicating a sequence. Intermediate projections may coalesce into one browser frame.
 
+For a deterministic shedding check, start more than ten observability article requests in one second. The first ten roots may receive browser trace admission; later pages must still return their static HTML without trace metadata. More than 30 snapshot requests or ten WebSocket handshakes in one second receive `429` and `Retry-After`. A new fixed window admits work again. Do not use this burst as the continuous feeder: its purpose is to prove that optional telemetry fails closed while content fails open.
+
 The observability stream retains at most 120 complete traces and 960 spans from the last five minutes, with no trace exceeding 16 spans. The Durable Object expires whole traces during quiet traffic and caps replay at 61 projections. The browser applies the same five-minute boundary while disconnected. See [architecture](architecture.md#observability-presentation-window) for the storage and alarm invariants.
 
 Do not run Astro and Wrangler on the same port. A dependency, Wrangler configuration, or build-output change requires restarting `dev:worker`; ordinary browser reloads do not.
@@ -89,7 +91,7 @@ npm run test
 npm run build
 ```
 
-`npm run check` runs those commands in order. The focused tests cover strict public span and OTLP validation, Worker-bound admission, joined parentage, out-of-order whole-trace assembly, exact SQLite trace and replay bounds, restart recovery, aggregate and heatmap derivation, slow-trace selection, waterfall geometry, sequence rejection, and the legacy tail-latency slice.
+`npm run check` runs those commands in order. The focused tests cover strict public span and OTLP validation, Worker-bound admission, fixed-window burst and expiry behavior, joined parentage, out-of-order whole-trace assembly, exact SQLite trace and replay bounds, restart recovery, aggregate and heatmap derivation, slow-trace selection, waterfall geometry, sequence rejection, and the legacy tail-latency slice.
 
 ## Rendered inspection
 
