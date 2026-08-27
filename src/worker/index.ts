@@ -23,6 +23,7 @@ import {
 } from "../domain/public-stream-storage";
 import { DurableObject, tracing } from "cloudflare:workers";
 import { publicSpanBatchSchema, type PublicSpan } from "../domain/public-span";
+import { parsePublicOtlpJson } from "../domain/public-otlp";
 import {
   finishDurableObjectSpan,
   finishWorkerSpan,
@@ -43,6 +44,15 @@ import {
   ingestPublicSpanBatch,
   nextTraceStoreAlarm,
 } from "../domain/public-trace-store";
+import {
+  PUBLIC_TRACE_ADMISSION_BATCH_LIMIT,
+  PUBLIC_TRACE_ADMISSION_HEADER,
+  PUBLIC_TRACE_ADMISSION_RATE_LIMIT,
+  PUBLIC_TRACE_ADMISSION_RATE_WINDOW_MS,
+  PUBLIC_TRACE_ADMISSION_TTL_MS,
+  admissionMatchesBatch,
+  publicTraceAdmissionSchema,
+} from "../domain/public-trace-admission";
 
 interface Env {
   ASSETS: Fetcher;
@@ -90,6 +100,18 @@ interface AlarmSampleRow {
   observed_at: number;
 }
 
+interface TraceAdmissionRow {
+  [key: string]: SqlStorageValue;
+  expires_at: number;
+  remaining_batches: number;
+  trace_id: string;
+}
+
+interface CountValueRow {
+  [key: string]: SqlStorageValue;
+  count: number;
+}
+
 export default {
   async fetch(request: Request, env: Env, context: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -105,6 +127,13 @@ export default {
     if (request.method === "GET" && url.pathname === "/__devloop/reload" && isLoopbackHttpUrl(env.DEVLOOP_BROWSER_EVENTS_URL)) {
       return fetch(env.DEVLOOP_BROWSER_EVENTS_URL, {
         headers: { accept: "text/event-stream" },
+      });
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/observability/v1/traces") {
+      return context.tracing.enterSpan("worker.span-intake", async (span) => {
+        span.setAttribute("app.telemetry.route_class", "intake");
+        return ingestPublicOtlpRequest(request, room);
       });
     }
 
@@ -191,6 +220,17 @@ export class TailLatencyRoom extends DurableObject<Env> {
         this.ctx.storage.sql.exec("ALTER TABLE replay ADD COLUMN oldest_observed_at INTEGER");
       }
       initializePublicTraceSchema(cloudflareTraceSql(this.ctx.storage.sql));
+      this.ctx.storage.sql.exec(`
+        CREATE TABLE IF NOT EXISTS browser_trace_admissions (
+          token TEXT PRIMARY KEY,
+          trace_id TEXT NOT NULL UNIQUE,
+          issued_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          remaining_batches INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS browser_trace_admissions_expiry_idx
+          ON browser_trace_admissions (expires_at, issued_at);
+      `);
     });
   }
 
@@ -198,6 +238,12 @@ export class TailLatencyRoom extends DurableObject<Env> {
     const url = new URL(request.url);
     if (request.method === "POST" && url.pathname === "/record") return this.record(request);
     if (request.method === "POST" && url.pathname === "/public-spans") return this.ingestSpans(request);
+    if (request.method === "POST" && url.pathname === "/public-browser-spans") {
+      return this.ingestBrowserSpans(request);
+    }
+    if (request.method === "POST" && url.pathname === "/public-trace-admissions") {
+      return this.issueTraceAdmission(request);
+    }
     if (request.method === "GET" && url.pathname === "/public-trace-state") {
       const store = this.publicTraceStore();
       return Response.json({
@@ -260,6 +306,69 @@ export class TailLatencyRoom extends DurableObject<Env> {
       headers: { "cache-control": "no-store", "x-content-type-options": "nosniff" },
       status: 202,
     });
+  }
+
+  private async ingestBrowserSpans(request: Request): Promise<Response> {
+    const token = request.headers.get(PUBLIC_TRACE_ADMISSION_HEADER);
+    const parsed = publicSpanBatchSchema.safeParse(await parseRequestJson(request));
+    if (!token || !parsed.success) return new Response("Invalid browser span batch", { status: 400 });
+
+    const now = Date.now();
+    const result = this.ctx.storage.transactionSync(() => {
+      this.deleteExpiredAdmissions(now);
+      const admission = this.ctx.storage.sql.exec<TraceAdmissionRow>(`
+        SELECT trace_id, expires_at, remaining_batches
+        FROM browser_trace_admissions WHERE token = ?
+      `, token).toArray()[0];
+      if (!admission || admission.expires_at < now || admission.remaining_batches <= 0 ||
+          !admissionMatchesBatch(admission.trace_id, parsed.data)) return null;
+      this.ctx.storage.sql.exec(`
+        UPDATE browser_trace_admissions
+        SET remaining_batches = remaining_batches - 1
+        WHERE token = ?
+      `, token);
+      return ingestPublicSpanBatch(PUBLIC_TRACE_STREAM, this.publicTraceStore(), parsed.data, now);
+    });
+    if (result === null) return new Response("Trace admission rejected", { status: 403 });
+    await this.scheduleNextAlarm(now);
+    return Response.json(result, {
+      headers: { "cache-control": "no-store", "x-content-type-options": "nosniff" },
+      status: 202,
+    });
+  }
+
+  private async issueTraceAdmission(request: Request): Promise<Response> {
+    const parsed = publicTraceAdmissionSchema.safeParse(await parseRequestJson(request));
+    if (!parsed.success) return new Response("Invalid trace admission", { status: 400 });
+
+    const now = Date.now();
+    const issued = this.ctx.storage.transactionSync(() => {
+      this.deleteExpiredAdmissions(now);
+      const recentlyIssued = Number(this.ctx.storage.sql.exec<CountValueRow>(`
+        SELECT COUNT(*) AS count FROM browser_trace_admissions WHERE issued_at >= ?
+      `, now - PUBLIC_TRACE_ADMISSION_RATE_WINDOW_MS).toArray()[0]?.count ?? 0);
+      const active = Number(this.ctx.storage.sql.exec<CountValueRow>(`
+        SELECT COUNT(*) AS count FROM browser_trace_admissions
+      `).toArray()[0]?.count ?? 0);
+      if (recentlyIssued >= PUBLIC_TRACE_ADMISSION_RATE_LIMIT || active >= PUBLIC_TRACE_STREAM.maxTraces) {
+        return false;
+      }
+      this.ctx.storage.sql.exec(`
+        INSERT INTO browser_trace_admissions
+          (token, trace_id, issued_at, expires_at, remaining_batches)
+        VALUES (?, ?, ?, ?, ?)
+      `, parsed.data.token, parsed.data.traceId, now, now + PUBLIC_TRACE_ADMISSION_TTL_MS,
+      PUBLIC_TRACE_ADMISSION_BATCH_LIMIT);
+      return true;
+    });
+    return new Response(null, {
+      headers: { "cache-control": "no-store" },
+      status: issued ? 201 : 429,
+    });
+  }
+
+  private deleteExpiredAdmissions(now: number): void {
+    this.ctx.storage.sql.exec("DELETE FROM browser_trace_admissions WHERE expires_at < ?", now);
   }
 
   private async traceSnapshot(request: Request): Promise<Response> {
@@ -619,14 +728,38 @@ async function tracePublicApiRequest(
 ): Promise<Response> {
   return context.tracing.enterSpan(`worker.${operation}-request`, async (nativeSpan) => {
     nativeSpan.setAttribute("app.telemetry.route_class", operation);
-    const started = startPublicSpan(request.headers.get("traceparent"), Date.now());
-    const response = await room.fetch(withTraceparent(request, started.traceparent));
+    const browserParent = request.headers.get("traceparent")
+      ?? (operation === "stream" ? new URL(request.url).searchParams.get("traceparent") : null);
+    const started = startPublicSpan(browserParent, Date.now());
+    const response = await room.fetch(withTraceparent(request, started.traceparent, operation === "stream"));
     nativeSpan.setAttribute("http.response.status_code", response.status);
     context.waitUntil(recordPublicRuntimeSpan(
       room,
       finishWorkerSpan(operation, started, response.status, Date.now()),
     ));
     return response;
+  });
+}
+
+async function ingestPublicOtlpRequest(
+  request: Request,
+  room: DurableObjectStub<TailLatencyRoom>,
+): Promise<Response> {
+  if (request.headers.get("content-type")?.split(";", 1)[0] !== "application/json") {
+    return new Response("Expected OTLP/HTTP JSON", { status: 415 });
+  }
+  const payload = await readBoundedJson(request, 64 * 1024);
+  if (payload === null) return new Response("Invalid or oversized OTLP payload", { status: 400 });
+  const spans = parsePublicOtlpJson(payload);
+  if (spans === null) return new Response("Disallowed OTLP span batch", { status: 400 });
+  const admissionToken = request.headers.get(PUBLIC_TRACE_ADMISSION_HEADER);
+  if (!admissionToken) return new Response("Missing trace admission", { status: 403 });
+
+  const stored = await recordPublicBrowserSpans(room, admissionToken, spans);
+  if (stored.status === 403) return new Response("Trace admission rejected", { status: 403 });
+  if (!stored.ok) return new Response("Telemetry storage unavailable", { status: 503 });
+  return Response.json({}, {
+    headers: { "cache-control": "no-store", "x-content-type-options": "nosniff" },
   });
 }
 
@@ -646,11 +779,19 @@ async function traceArticleRequest(
     let response = await env.ASSETS.fetch(request);
 
     if (publicStarted) {
-      response = injectTraceparent(response, publicStarted.traceparent);
-      context.waitUntil(recordPublicRuntimeSpan(
+      const admissionToken = crypto.randomUUID().replaceAll("-", "");
+      const admitted = await issueBrowserTraceAdmission(
         room,
-        finishWorkerSpan("article", publicStarted, response.status, Date.now()),
-      ));
+        admissionToken,
+        publicStarted.context.traceId,
+      );
+      if (admitted) {
+        response = injectBrowserTraceContext(response, publicStarted.traceparent, admissionToken);
+        context.waitUntil(recordPublicRuntimeSpan(
+          room,
+          finishWorkerSpan("article", publicStarted, response.status, Date.now()),
+        ));
+      }
     }
 
     const sample = {
@@ -673,30 +814,104 @@ function recordPublicRuntimeSpan(
   room: DurableObjectStub<TailLatencyRoom>,
   span: PublicSpan,
 ): Promise<Response> {
+  return recordPublicRuntimeSpans(room, [span]);
+}
+
+function recordPublicRuntimeSpans(
+  room: DurableObjectStub<TailLatencyRoom>,
+  spans: readonly PublicSpan[],
+): Promise<Response> {
   return room.fetch(new Request("https://observability.internal/public-spans", {
-    body: JSON.stringify([span]),
+    body: JSON.stringify(spans),
     headers: { "content-type": "application/json" },
     method: "POST",
   }));
 }
 
-function withTraceparent(request: Request, traceparent: string): Request {
-  const headers = new Headers(request.headers);
-  headers.set("traceparent", traceparent);
-  return new Request(request, { headers });
+function recordPublicBrowserSpans(
+  room: DurableObjectStub<TailLatencyRoom>,
+  admissionToken: string,
+  spans: readonly PublicSpan[],
+): Promise<Response> {
+  return room.fetch(new Request("https://observability.internal/public-browser-spans", {
+    body: JSON.stringify(spans),
+    headers: {
+      "content-type": "application/json",
+      [PUBLIC_TRACE_ADMISSION_HEADER]: admissionToken,
+    },
+    method: "POST",
+  }));
 }
 
-function injectTraceparent(response: Response, traceparent: string): Response {
+async function issueBrowserTraceAdmission(
+  room: DurableObjectStub<TailLatencyRoom>,
+  token: string,
+  traceId: string,
+): Promise<boolean> {
+  const response = await room.fetch(new Request("https://observability.internal/public-trace-admissions", {
+    body: JSON.stringify({ token, traceId }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  }));
+  return response.status === 201;
+}
+
+async function readBoundedJson(request: Request, maxBytes: number): Promise<unknown | null> {
+  if (!request.body) return null;
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      totalBytes += chunk.value.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel("OTLP payload exceeds the public intake limit");
+        return null;
+      }
+      chunks.push(chunk.value);
+    }
+    const body = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      body.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body)) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function withTraceparent(request: Request, traceparent: string, stripQueryContext: boolean): Request {
+  const headers = new Headers(request.headers);
+  headers.set("traceparent", traceparent);
+  if (!stripQueryContext) return new Request(request, { headers });
+  const url = new URL(request.url);
+  url.searchParams.delete("traceparent");
+  return new Request(url, { headers, method: request.method });
+}
+
+function injectBrowserTraceContext(
+  response: Response,
+  traceparent: string,
+  admissionToken: string,
+): Response {
   if (!response.headers.get("content-type")?.startsWith("text/html")) return response;
   const transformed = new HTMLRewriter()
     .on("head", {
       element(element) {
-        element.prepend(`<meta name="traceparent" content="${traceparent}">`, { html: true });
+        element.prepend(
+          `<meta name="traceparent" content="${traceparent}"><meta name="public-trace-admission" content="${admissionToken}">`,
+          { html: true },
+        );
       },
     })
     .transform(response);
-  transformed.headers.set("cache-control", "no-store");
-  return transformed;
+  const uncached = new Response(transformed.body, transformed);
+  uncached.headers.set("cache-control", "no-store");
+  return uncached;
 }
 
 function serverOperation(pathname: string): Exclude<PublicServerOperation, "article"> | null {

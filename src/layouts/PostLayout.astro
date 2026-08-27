@@ -6,11 +6,13 @@ interface Props {
     title: string;
     description: string;
     published: string;
+    telemetry?: "observability";
   };
 }
 
 const { frontmatter } = Astro.props;
 const devloopBrowserEventsUrl = import.meta.env.DEVLOOP_BROWSER_EVENTS_URL;
+import ObservabilityTelemetry from "../components/ObservabilityTelemetry.astro";
 ---
 
 <!doctype html>
@@ -23,6 +25,7 @@ const devloopBrowserEventsUrl = import.meta.env.DEVLOOP_BROWSER_EVENTS_URL;
     <title>{frontmatter.title} · Live Dashblog</title>
   </head>
   <body>
+    {frontmatter.telemetry === "observability" && <ObservabilityTelemetry />}
     <header class="mx-auto flex max-w-6xl items-center justify-between px-5 py-7 md:px-10">
       <a class="text-sm font-semibold tracking-[0.2em] no-underline uppercase" href="/">Live Dashblog</a>
       <span class="text-xs text-[var(--muted)]">instrumented essays</span>
