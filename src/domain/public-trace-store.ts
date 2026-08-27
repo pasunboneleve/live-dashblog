@@ -45,6 +45,7 @@ export interface PublicTraceStore {
   deleteTracesSeenOutside(cutoff: number, now: number): TraceDeletion;
   dueTraceIds(now: number): string[];
   markFinalized(traceId: string, finalizedAt: number): void;
+  readFinalizedTraces(): PublicSpan[][];
   readTrace(traceId: string): PublicSpan[];
   spanCount(traceId: string): number;
   upsertSpan(span: PublicSpan, receivedAt: number, finalizeAfter: number): SpanUpsertResult;

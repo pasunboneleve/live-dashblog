@@ -54,6 +54,37 @@ describe("whole-trace assembly", () => {
     expect(readFinalizedAt(database)).toBe(receivedAt + PUBLIC_TRACE_STREAM.assemblyGraceMs);
   });
 
+  it("finalizes an earlier due trace when a new batch arrives at its deadline", () => {
+    const { store } = createStore();
+    const receivedAt = 2_500_000;
+    ingestPublicSpanBatch(PUBLIC_TRACE_STREAM, store, JOINED_PUBLIC_TRACE, receivedAt);
+
+    const result = ingestPublicSpanBatch(
+      PUBLIC_TRACE_STREAM,
+      store,
+      rekeyTrace(JOINED_PUBLIC_TRACE.slice(0, 1), 8),
+      receivedAt + PUBLIC_TRACE_STREAM.assemblyGraceMs,
+    );
+
+    expect(result.finalized).toBe(1);
+    expect(store.readFinalizedTraces()).toHaveLength(1);
+  });
+
+  it("reports an earlier invalid trace deleted by a new batch at its deadline", () => {
+    const { store } = createStore();
+    const receivedAt = 2_700_000;
+    ingestPublicSpanBatch(PUBLIC_TRACE_STREAM, store, JOINED_PUBLIC_TRACE.slice(1, 2), receivedAt);
+
+    const result = ingestPublicSpanBatch(
+      PUBLIC_TRACE_STREAM,
+      store,
+      rekeyTrace(JOINED_PUBLIC_TRACE.slice(0, 1), 9),
+      receivedAt + PUBLIC_TRACE_STREAM.assemblyGraceMs,
+    );
+
+    expect(result.invalidTracesDeleted).toBe(1);
+  });
+
   it("reopens and refinalizes a trace when a late span changes it", () => {
     const { database, store } = createStore();
     const receivedAt = 3_000_000;
@@ -90,6 +121,30 @@ describe("whole-trace assembly", () => {
     expect(finalizeDueTraces(store, receivedAt + PUBLIC_TRACE_STREAM.assemblyGraceMs))
       .toEqual({ finalized: 0, invalidTracesDeleted: 1 });
     expect(store.counts()).toEqual({ spans: 0, traces: 0 });
+  });
+
+  it("reads only finalized whole traces in first-seen order", () => {
+    const { store } = createStore();
+    const later = rekeyTrace(JOINED_PUBLIC_TRACE, 2);
+    const earlier = rekeyTrace(JOINED_PUBLIC_TRACE, 1);
+    ingestPublicSpanBatch(PUBLIC_TRACE_STREAM, store, earlier, 4_700_001);
+    ingestPublicSpanBatch(PUBLIC_TRACE_STREAM, store, later, 4_700_002);
+
+    expect(store.readFinalizedTraces()).toEqual([]);
+    finalizeDueTraces(store, 4_700_002 + PUBLIC_TRACE_STREAM.assemblyGraceMs);
+
+    expect(store.readFinalizedTraces().map((trace) => trace[0]!.traceId))
+      .toEqual([traceIdFor(1), traceIdFor(2)]);
+  });
+
+  it("fails the finalized view closed when any stored trace is corrupt", () => {
+    const { database, store } = createStore();
+    ingestPublicSpanBatch(PUBLIC_TRACE_STREAM, store, JOINED_PUBLIC_TRACE, 4_800_000);
+    finalizeDueTraces(store, 4_800_000 + PUBLIC_TRACE_STREAM.assemblyGraceMs);
+    database.prepare("UPDATE public_spans SET payload = 'not-json' WHERE span_id = ?")
+      .run(JOINED_PUBLIC_TRACE[1]!.spanId);
+
+    expect(store.readFinalizedTraces()).toEqual([]);
   });
 });
 

@@ -129,6 +129,17 @@ export class SqlPublicTraceStore implements PublicTraceStore {
     );
   }
 
+  /** Returns one all-or-nothing view of complete traces for projection derivation. */
+  readFinalizedTraces(): PublicSpan[][] {
+    const traceIds = this.sql.exec<TraceIdRow>(`
+      SELECT trace_id FROM public_traces
+      WHERE finalized_at IS NOT NULL
+      ORDER BY first_seen_at, trace_id
+    `).toArray();
+    const traces = traceIds.map((row) => this.readTrace(row.trace_id));
+    return traces.some((trace) => trace.length === 0) ? [] : traces;
+  }
+
   nextFinalizeAt(): number | null {
     const value = this.sql.exec<DeadlineRow>(`
       SELECT MIN(finalize_after) AS deadline FROM public_traces
