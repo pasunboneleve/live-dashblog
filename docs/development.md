@@ -105,6 +105,7 @@ Before declaring a visualization production-ready, inspect the Worker-served art
 - request `P95` uses root-span duration, while the selected trace labels its separate observed window;
 - no more than five trace selectors and 16 keyed waterfall rows exist;
 - changing the selected trace updates `aria-pressed` and the waterfall description;
+- the waterfall clock starts at the root request, corrects each service clock without collapsing its elapsed intervals, and moves spans after more than one idle second into the bounded keyed activity list;
 - browser, Worker, and Durable Object bars remain distinguishable without motion;
 - labels do not overlap and horizontal overflow remains inside the dashboard on narrow screens;
 - the embedded joined trace remains legible with the Worker stopped.

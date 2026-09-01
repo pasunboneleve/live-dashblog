@@ -217,8 +217,8 @@ export function mountObservability(root: HTMLElement): void {
       traceIsEmbeddedFallback: trace === embeddedTrace
         && !current.traceSamples.some((candidate) => candidate.traceId === trace.traceId),
     });
-    setText("[data-selected-trace-summary]", `${source} · ${formatDuration(trace.requestDurationMs)} request · ${formatDuration(trace.observedWindowMs)} observed window · ${trace.spans.length} joined spans`);
-    if (description) description.textContent = `${trace.spans.length} joined spans across a ${formatDuration(trace.observedWindowMs)} observed window. Each row prints its own duration.`;
+    setText("[data-selected-trace-summary]", `${source} · ${formatDuration(trace.requestDurationMs)} request · ${formatDuration(geometry.initialActivityMs)} initial activity · ${formatDuration(trace.observedWindowMs)} observed · ${trace.spans.length} joined spans`);
+    if (description) description.textContent = `${geometry.spans.length} spans scaled across ${formatDuration(geometry.initialActivityMs)} of contiguous initial activity. Activity after a one-second gap is listed below and does not change the chart scale.`;
     const existing = new Map(
       [...rows.querySelectorAll<SVGGElement>("g[data-span-id]")]
         .map((group) => [group.dataset.spanId!, group]),
@@ -246,6 +246,42 @@ export function mountObservability(root: HTMLElement): void {
       existing.delete(span.spanId);
     }
     for (const group of existing.values()) group.remove();
+    renderLaterActivity(geometry.laterSpans);
+  }
+
+  function renderLaterActivity(laterSpans: ReturnType<typeof createWaterfallGeometry>["laterSpans"]): void {
+    const section = root.querySelector<HTMLElement>("[data-later-activity]");
+    const list = section?.querySelector<HTMLOListElement>("[data-later-spans]");
+    if (!section || !list) return;
+    section.hidden = laterSpans.length === 0;
+    setText(
+      "[data-later-activity-summary]",
+      `${laterSpans.length} ${plural(laterSpans.length, "span")} resumed after at least one quiet second. ${laterSpans.length === 1 ? "It remains" : "They remain"} joined to this trace without stretching the initial-activity clock.`,
+    );
+    const existing = new Map(
+      [...list.querySelectorAll<HTMLLIElement>("li[data-later-span-id]")]
+        .map((item) => [item.dataset.laterSpanId!, item]),
+    );
+    for (const span of laterSpans) {
+      let item = existing.get(span.spanId);
+      if (!item) {
+        item = document.createElement("li");
+        item.dataset.laterSpanId = span.spanId;
+        item.appendChild(document.createElement("span"));
+        item.appendChild(document.createElement("strong"));
+        item.appendChild(document.createElement("span"));
+        item.appendChild(document.createElement("span"));
+        list.appendChild(item);
+      }
+      const [runtime, label, offset, duration] = [...item.children] as [HTMLSpanElement, HTMLElement, HTMLSpanElement, HTMLSpanElement];
+      runtime.className = `activity-runtime ${span.runtimeSide}`;
+      runtime.setAttribute("aria-hidden", "true");
+      label.textContent = span.label;
+      offset.textContent = `${span.offsetLabel} from request`;
+      duration.textContent = span.durationLabel;
+      existing.delete(span.spanId);
+    }
+    for (const item of existing.values()) item.remove();
   }
 
   function selectBucket(startUnixMs: number): void {

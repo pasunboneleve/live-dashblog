@@ -109,7 +109,7 @@ function durationBand(lower: number, upper: number): string {
     <div class="waterfall-heading">
       <div>
         <h3 id="waterfall-title">Selected trace</h3>
-        <p class="trace-summary" data-selected-trace-summary>{selectedTrace ? `${milliseconds(selectedTrace.requestDurationMs)} request · ${milliseconds(selectedTrace.observedWindowMs)} observed window · ${selectedTrace.spans.length} joined spans` : "Embedded example"}</p>
+        <p class="trace-summary" data-selected-trace-summary>{selectedTrace ? `${milliseconds(selectedTrace.requestDurationMs)} request · ${milliseconds(waterfall.initialActivityMs)} initial activity · ${milliseconds(selectedTrace.observedWindowMs)} observed · ${selectedTrace.spans.length} joined spans` : "Embedded example"}</p>
         <p class="sampling" data-sampling>{percent(projection.sampling.sampleRate)} admitted · {projection.sampling.droppedTraceCount} dropped</p>
       </div>
       <div class="trace-choices" data-trace-choices aria-label="Select a trace from this interval">
@@ -120,7 +120,7 @@ function durationBand(lower: number, upper: number): string {
     </div>
     <svg data-waterfall viewBox={waterfall.viewBox} role="img" aria-labelledby="waterfall-svg-title waterfall-svg-description">
       <title id="waterfall-svg-title">Selected browser, Worker, and Durable Object trace</title>
-      <desc id="waterfall-svg-description" data-waterfall-description>{selectedTrace ? `${selectedTrace.spans.length} joined spans across a ${milliseconds(selectedTrace.observedWindowMs)} observed window.` : "Embedded joined trace example."}</desc>
+      <desc id="waterfall-svg-description" data-waterfall-description>{selectedTrace ? `${waterfall.spans.length} spans scaled across ${milliseconds(waterfall.initialActivityMs)} of contiguous initial activity. Activity after a one-second gap is listed below and does not change the chart scale.` : "Embedded joined trace example."}</desc>
       <g data-waterfall-rows>
         {waterfall.spans.map((span) => (
           <g data-span-id={span.spanId}>
@@ -132,6 +132,22 @@ function durationBand(lower: number, upper: number): string {
       </g>
     </svg>
     <div class="runtime-legend" aria-label="Trace runtime colours"><span class="browser">browser</span><span class="worker">Worker</span><span class="durable-object">Durable Object</span></div>
+    <section class="later-activity" data-later-activity hidden={waterfall.laterSpans.length === 0} aria-labelledby="later-activity-title">
+      <div>
+        <h4 id="later-activity-title">Later page activity</h4>
+        <p data-later-activity-summary>{waterfall.laterSpans.length} spans resumed after at least one quiet second. They remain joined to this trace without stretching the initial-activity clock.</p>
+      </div>
+      <ol data-later-spans>
+        {waterfall.laterSpans.map((span) => (
+          <li data-later-span-id={span.spanId}>
+            <span class={`activity-runtime ${span.runtimeSide}`} aria-hidden="true"></span>
+            <strong>{span.label}</strong>
+            <span>{span.offsetLabel} from request</span>
+            <span>{span.durationLabel}</span>
+          </li>
+        ))}
+      </ol>
+    </section>
   </section>
 
   <p class="footnote">Only allowlisted operation names, runtime classes, status, duration, and trace relationships reach this view. Intake and rendering do not observe themselves.</p>
@@ -205,6 +221,16 @@ function durationBand(lower: number, upper: number): string {
   .runtime-legend .browser::before { background: var(--cyan); }
   .runtime-legend .worker::before { background: var(--amber); }
   .runtime-legend .durable-object::before { background: #a78bfa; }
+  .later-activity { margin: 1rem 1.35rem 0; padding-top: 1rem; border-top: 1px solid var(--line); }
+  .later-activity[hidden] { display: none; }
+  .later-activity h4 { margin: 0; color: var(--ink); font-size: 0.82rem; font-weight: 550; }
+  .later-activity p { margin: 0.3rem 0 0; color: var(--muted); font-size: 0.72rem; line-height: 1.5; }
+  .later-activity ol { display: grid; gap: 0.35rem; margin: 0.8rem 0 0; padding: 0; list-style: none; }
+  .later-activity :global(li) { display: grid; grid-template-columns: auto minmax(10rem, 1fr) auto auto; align-items: center; gap: 0.7rem; padding: 0.45rem 0.6rem; border-radius: 0.25rem; background: color-mix(in srgb, var(--surface) 84%, black); color: var(--muted); font-size: 0.7rem; }
+  .later-activity :global(li strong) { color: var(--ink); font-weight: 500; }
+  .observability :global(.activity-runtime) { width: 0.5rem; height: 0.5rem; border-radius: 999px; background: var(--cyan); }
+  .observability :global(.activity-runtime.worker) { background: var(--amber); }
+  .observability :global(.activity-runtime.durable-object) { background: #a78bfa; }
   .footnote { margin: 0; padding: 1rem 1.35rem; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.75rem; }
   @media (max-width: 760px) {
     .panel-heading, .waterfall-heading, .section-heading { display: block; }
@@ -214,6 +240,8 @@ function durationBand(lower: number, upper: number): string {
     .summary div:nth-child(-n + 3) { border-bottom: 1px solid var(--line); }
     .detail-grid { grid-template-columns: 1fr; }
     .duration-bands { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .later-activity :global(li) { grid-template-columns: auto minmax(9rem, 1fr) auto; }
+    .later-activity :global(li span:last-child) { display: none; }
     .time-series, [data-waterfall] { min-width: 42rem; }
     .time-series-section, .waterfall-section { overflow-x: auto; }
   }
