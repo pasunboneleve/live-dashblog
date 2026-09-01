@@ -12,15 +12,35 @@ paths = [
   "src/pages/404.astro",
   "src/pages/index.astro",
   "src/pages/posts/tail-latency.mdx",
+  "src/pages/posts/observability.mdx",
   "src/layouts/PostLayout.astro",
   "src/components/TailLatencyDashboard.astro",
+  "src/components/ObservabilityDashboard.astro",
+  "src/components/ObservabilityTelemetry.astro",
   "src/styles/global.css",
   "src/visualizations/page-stream.ts",
+  "src/visualizations/observability-geometry.ts",
+  "src/visualizations/observability-stream.ts",
+  "src/visualizations/observability.ts",
+  "src/telemetry/browser-otlp-exporter.ts",
+  "src/telemetry/browser-telemetry-hooks.ts",
+  "src/telemetry/browser-telemetry.ts",
   "src/visualizations/latest-value-animator.ts",
   "src/visualizations/tail-latency-geometry.ts",
   "src/visualizations/tail-latency.ts",
   "src/domain/public-stream-storage.ts",
   "src/domain/public-stream.ts",
+  "src/domain/public-observability-sql.ts",
+  "src/domain/public-observability.ts",
+  "src/domain/public-request-budget-sql.ts",
+  "src/domain/public-span.ts",
+  "src/domain/public-telemetry-budget.ts",
+  "src/domain/fixtures/public-spans.ts",
+  "src/domain/public-trace-sql.ts",
+  "src/domain/public-trace-store.ts",
+  "src/domain/public-runtime-span.ts",
+  "src/domain/public-otlp.ts",
+  "src/domain/trace-context.ts",
   "src/domain/tail-latency.ts",
   "public/devloop-reload.js",
   "public/favicon.svg",
@@ -29,7 +49,11 @@ paths = [
 workflow = "site_changed"
 
 [watch.worker]
-paths = ["src/worker/index.ts"]
+paths = [
+  "src/worker/index.ts",
+  "src/worker/public-intake-response.ts",
+  "src/worker/public-runtime-span-policy.ts",
+]
 workflow = "worker_changed"
 
 [watch.worker_config]
@@ -64,7 +88,7 @@ steps = [
   { action = "run_hook", hook = "build_site" },
   { action = "start_process", process = "worker" },
   { action = "run_hook", hook = "wait_worker" },
-  { action = "log", message = "live review: http://127.0.0.1:8787/posts/tail-latency/", style = "boxed" },
+  { action = "log", message = "live review: http://127.0.0.1:8787/posts/observability/", style = "boxed" },
 ]
 
 [workflow.site_changed]

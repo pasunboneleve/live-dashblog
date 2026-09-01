@@ -1,4 +1,10 @@
 import { STREAM_NAME, acceptProjectionEnvelope, type TailLatencyProjection } from "../domain/tail-latency";
+import {
+  recordTelemetryFinalPaint,
+  recordTelemetryReducerApplication,
+  telemetryFetch,
+  telemetryWebSocket,
+} from "../telemetry/browser-telemetry-hooks";
 
 type ProjectionRenderer = (projection: TailLatencyProjection) => void;
 interface Subscription { active: boolean; render: ProjectionRenderer }
@@ -34,7 +40,7 @@ function connect(): void {
   if (!snapshotAttempted) {
     snapshotAttempted = true;
     snapshotPending = true;
-    void fetch("/api/tail-latency/snapshot")
+    void telemetryFetch("/api/tail-latency/snapshot")
       .then((response) => {
         if (!response.ok) throw new Error(`snapshot request failed with ${response.status}`);
         return response.json() as Promise<unknown>;
@@ -67,7 +73,7 @@ function openSocket(): void {
   const url = new URL(`${protocol}//${location.host}/api/stream`);
   url.searchParams.set("streams", STREAM_NAME);
   url.searchParams.set("since", String(lastSequence));
-  socket = new WebSocket(url);
+  socket = telemetryWebSocket(url);
   socket.addEventListener("message", (event) => {
     const projection = acceptProjectionEnvelope(lastSequence, parseJson(event.data));
     if (!projection) return;
@@ -88,7 +94,9 @@ function scheduleRender(): void {
     framePending = false;
     const latest = latestByStream.get(STREAM_NAME);
     if (!latest) return;
+    recordTelemetryReducerApplication();
     for (const subscription of subscriptions) if (subscription.active) subscription.render(latest);
+    requestAnimationFrame(recordTelemetryFinalPaint);
   });
 }
 

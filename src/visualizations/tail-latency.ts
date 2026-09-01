@@ -14,6 +14,7 @@ import {
   LatestValueAnimator,
   type AnimationFrameClock,
 } from "./latest-value-animator";
+import { recordTelemetryHydrationComplete } from "../telemetry/browser-telemetry-hooks";
 
 const ANIMATION_DURATION_MS = 800;
 const browserFrameClock: AnimationFrameClock = {
@@ -85,6 +86,7 @@ export function mountTailLatency(root: HTMLElement): void {
   window.addEventListener("pageshow", handlePageShow);
   observer.observe(root);
   presentCurrent(false);
+  recordTelemetryHydrationComplete();
 
   function presentCurrent(animate: boolean): void {
     if (!active) return;

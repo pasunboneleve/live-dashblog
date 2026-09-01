@@ -17,17 +17,71 @@ import {
 } from "../domain/tail-latency";
 import { nextPresentationExpiry } from "../domain/public-stream";
 import {
+  OBSERVABILITY_STREAM_NAME,
+  projectPublicObservability,
+  publicObservabilityEnvelopeSchema,
+  type PublicObservabilityProjection,
+} from "../domain/public-observability";
+import {
+  SqlPublicObservabilityStore,
+  initializePublicObservabilitySchema,
+} from "../domain/public-observability-sql";
+import {
   enforcePublicStreamRetention,
   type PublicStreamRetentionStore,
   type RetentionResult,
 } from "../domain/public-stream-storage";
-import { DurableObject } from "cloudflare:workers";
+import { DurableObject, tracing } from "cloudflare:workers";
+import { publicSpanBatchSchema, type PublicSpan } from "../domain/public-span";
+import { parsePublicOtlpJson } from "../domain/public-otlp";
+import {
+  finishDurableObjectSpan,
+  finishWorkerSpan,
+  startPublicSpan,
+  type PublicServerOperation,
+} from "../domain/public-runtime-span";
+import {
+  SqlPublicTraceStore,
+  initializePublicTraceSchema,
+  type TraceSql,
+  type TraceSqlCursor,
+  type TraceSqlValue,
+} from "../domain/public-trace-sql";
+import {
+  PUBLIC_TRACE_STREAM,
+  enforceWholeTraceRetention,
+  finalizeDueTraces,
+  ingestPublicSpanBatch,
+  nextTraceStoreAlarm,
+  type PublicSpanBatchResult,
+} from "../domain/public-trace-store";
+import {
+  PUBLIC_TRACE_ADMISSION_BATCH_LIMIT,
+  PUBLIC_TRACE_ADMISSION_HEADER,
+  PUBLIC_TRACE_ADMISSION_TTL_MS,
+  admissionMatchesBatch,
+  publicTraceAdmissionSchema,
+} from "../domain/public-trace-admission";
+import {
+  PUBLIC_TELEMETRY_BUDGET,
+  hasPublicWebSocketCapacity,
+  retryAfterSeconds,
+  type FixedWindowBudget,
+} from "../domain/public-telemetry-budget";
+import {
+  SqlPublicRequestBudgetStore,
+  initializePublicRequestBudgetSchema,
+} from "../domain/public-request-budget-sql";
+import { publicIntakeStorageFailure } from "./public-intake-response";
+import { shouldRecordPublicRuntimeSpan } from "./public-runtime-span-policy";
 
 interface Env {
   ASSETS: Fetcher;
   DEVLOOP_BROWSER_EVENTS_URL?: string;
   TAIL_LATENCY: DurableObjectNamespace<TailLatencyRoom>;
 }
+
+const OBSERVABILITY_ARTICLE_PATH = "/posts/observability/";
 
 interface StoredSampleRow {
   [key: string]: SqlStorageValue;
@@ -67,6 +121,18 @@ interface AlarmSampleRow {
   observed_at: number;
 }
 
+interface TraceAdmissionRow {
+  [key: string]: SqlStorageValue;
+  expires_at: number;
+  remaining_batches: number;
+  trace_id: string;
+}
+
+interface CountValueRow {
+  [key: string]: SqlStorageValue;
+  count: number;
+}
+
 export default {
   async fetch(request: Request, env: Env, context: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -85,8 +151,29 @@ export default {
       });
     }
 
-    if (url.pathname === "/api/stream" || url.pathname === "/api/tail-latency/snapshot") {
-      return room.fetch(request);
+    if (request.method === "POST" && url.pathname === "/api/observability/v1/traces") {
+      return context.tracing.enterSpan("worker.span-intake", async (span) => {
+        span.setAttribute("app.telemetry.route_class", "intake");
+        return ingestPublicOtlpRequest(request, room);
+      });
+    }
+
+    if (isLoopbackHttpUrl(env.DEVLOOP_BROWSER_EVENTS_URL) &&
+        (url.pathname === "/__devloop/public-spans" || url.pathname === "/__devloop/public-trace-state")) {
+      const internalPath = url.pathname === "/__devloop/public-spans" ? "/public-spans" : "/public-trace-state";
+      return context.tracing.enterSpan("worker.span-intake", (span) => {
+        span.setAttribute("app.telemetry.route_class", "intake");
+        return room.fetch(new Request(`https://observability.internal${internalPath}`, request));
+      });
+    }
+
+    const publicServerOperation = serverOperation(url.pathname);
+    if (publicServerOperation) {
+      return tracePublicApiRequest(publicServerOperation, request, room, context);
+    }
+
+    if (request.method === "GET" && url.pathname.startsWith("/posts/")) {
+      return traceArticleRequest(request, url, env, room, context);
     }
 
     const startedAt = performance.now();
@@ -153,14 +240,50 @@ export class TailLatencyRoom extends DurableObject<Env> {
       if (!replayColumns.some((column) => column.name === "oldest_observed_at")) {
         this.ctx.storage.sql.exec("ALTER TABLE replay ADD COLUMN oldest_observed_at INTEGER");
       }
+      initializePublicTraceSchema(cloudflareTraceSql(this.ctx.storage.sql));
+      initializePublicObservabilitySchema(cloudflareTraceSql(this.ctx.storage.sql));
+      initializePublicRequestBudgetSchema(cloudflareTraceSql(this.ctx.storage.sql));
+      this.ctx.storage.sql.exec(`
+        CREATE TABLE IF NOT EXISTS browser_trace_admissions (
+          token TEXT PRIMARY KEY,
+          trace_id TEXT NOT NULL UNIQUE,
+          issued_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          remaining_batches INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS browser_trace_admissions_expiry_idx
+          ON browser_trace_admissions (expires_at, issued_at);
+      `);
     });
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "POST" && url.pathname === "/record") return this.record(request);
-    if (request.method === "GET" && url.pathname === "/api/tail-latency/snapshot") return this.snapshot();
-    if (request.method === "GET" && url.pathname === "/api/stream") return this.connectWebSocket(request);
+    if (request.method === "POST" && url.pathname === "/public-spans") return this.ingestSpans(request);
+    if (request.method === "POST" && url.pathname === "/public-browser-spans") {
+      return this.ingestBrowserSpans(request);
+    }
+    if (request.method === "POST" && url.pathname === "/public-trace-admissions") {
+      return this.issueTraceAdmission(request);
+    }
+    if (request.method === "GET" && url.pathname === "/public-trace-state") {
+      const store = this.publicTraceStore();
+      return Response.json({
+        counts: store.counts(),
+        nextFinalizeAt: store.nextFinalizeAt(),
+        oldestFirstSeenAt: store.oldestFirstSeenAt(),
+      }, { headers: { "cache-control": "no-store" } });
+    }
+    if (request.method === "GET" && url.pathname === "/api/tail-latency/snapshot") {
+      return this.traceSnapshot(request);
+    }
+    if (request.method === "GET" && url.pathname === "/api/observability/snapshot") {
+      return this.traceSnapshot(request);
+    }
+    if (request.method === "GET" && url.pathname === "/api/stream") {
+      return this.traceStreamConnect(request);
+    }
     return new Response("Not found", { status: 404 });
   }
 
@@ -174,6 +297,12 @@ export class TailLatencyRoom extends DurableObject<Env> {
 
   async alarm(): Promise<void> {
     const now = Date.now();
+    const observability = this.publicObservabilityStore();
+    if (this.maintainPublicTraces(now)) observability.markDirty();
+    const observabilityRetention = observability.enforceRetention(now);
+    if (observabilityRetention.dropBucketsDeleted > 0 ||
+        observabilityRetention.samplingBucketsDeleted > 0) observability.markDirty();
+    this.publishObservabilityIfDue(now);
     const retention = this.enforceRetention(now);
     const current = this.currentRow();
     const cursor = retainBroadcastCursor(fromCurrentRow(current));
@@ -190,6 +319,175 @@ export class TailLatencyRoom extends DurableObject<Env> {
       if (retention.pointsDeleted > 0) this.persistCurrentProjection(now);
       await this.scheduleNextAlarm(now, action.at);
     }
+  }
+
+  private async ingestSpans(request: Request): Promise<Response> {
+    const parsed = publicSpanBatchSchema.safeParse(await parseRequestJson(request));
+    if (!parsed.success) return new Response("Invalid public span batch", { status: 400 });
+
+    const now = Date.now();
+    const result = this.ctx.storage.transactionSync(() => ingestPublicSpanBatch(
+      PUBLIC_TRACE_STREAM,
+      this.publicTraceStore(),
+      parsed.data,
+      now,
+    ));
+    this.recordObservabilityIngestResult(result, now);
+    await this.scheduleNextAlarm(now);
+    return Response.json(result, {
+      headers: { "cache-control": "no-store", "x-content-type-options": "nosniff" },
+      status: 202,
+    });
+  }
+
+  private async ingestBrowserSpans(request: Request): Promise<Response> {
+    const token = request.headers.get(PUBLIC_TRACE_ADMISSION_HEADER);
+    const parsed = publicSpanBatchSchema.safeParse(await parseRequestJson(request));
+    if (!token || !parsed.success) return new Response("Invalid browser span batch", { status: 400 });
+
+    const now = Date.now();
+    const outcome = this.ctx.storage.transactionSync(() => {
+      this.deleteExpiredAdmissions(now);
+      const admission = this.ctx.storage.sql.exec<TraceAdmissionRow>(`
+        SELECT trace_id, expires_at, remaining_batches
+        FROM browser_trace_admissions WHERE token = ?
+      `, token).toArray()[0];
+      if (!admission || admission.expires_at < now || admission.remaining_batches <= 0 ||
+          !admissionMatchesBatch(admission.trace_id, parsed.data)) return { kind: "rejected" } as const;
+      if (!this.publicRequestBudgetStore().tryConsume(
+        "intake",
+        PUBLIC_TELEMETRY_BUDGET.intake.requests,
+        now,
+      )) return { kind: "shed" } as const;
+      this.ctx.storage.sql.exec(`
+        UPDATE browser_trace_admissions
+        SET remaining_batches = remaining_batches - 1
+        WHERE token = ?
+      `, token);
+      return {
+        kind: "stored",
+        result: ingestPublicSpanBatch(PUBLIC_TRACE_STREAM, this.publicTraceStore(), parsed.data, now),
+      } as const;
+    });
+    if (outcome.kind === "rejected") return new Response("Trace admission rejected", { status: 403 });
+    if (outcome.kind === "shed") {
+      return budgetExceededResponse(now, PUBLIC_TELEMETRY_BUDGET.intake.requests);
+    }
+    this.recordObservabilityIngestResult(outcome.result, now);
+    await this.scheduleNextAlarm(now);
+    return Response.json(outcome.result, {
+      headers: { "cache-control": "no-store", "x-content-type-options": "nosniff" },
+      status: 202,
+    });
+  }
+
+  private async issueTraceAdmission(request: Request): Promise<Response> {
+    const parsed = publicTraceAdmissionSchema.safeParse(await parseRequestJson(request));
+    if (!parsed.success) return new Response("Invalid trace admission", { status: 400 });
+
+    const now = Date.now();
+    const decision = this.ctx.storage.transactionSync(() => {
+      this.deleteExpiredAdmissions(now);
+      const active = Number(this.ctx.storage.sql.exec<CountValueRow>(`
+        SELECT COUNT(*) AS count FROM browser_trace_admissions
+      `).toArray()[0]?.count ?? 0);
+      const budgets = this.publicRequestBudgetStore();
+      if (active >= PUBLIC_TELEMETRY_BUDGET.rootTraces.maxActive ||
+          !budgets.tryConsume(
+            "root-trace",
+            PUBLIC_TELEMETRY_BUDGET.rootTraces.requests,
+            now,
+          )) {
+        return {
+          issued: false,
+          recordRejection: budgets.recordRejectionOnce(
+            "root-trace",
+            PUBLIC_TELEMETRY_BUDGET.rootTraces.requests,
+            now,
+          ),
+        };
+      }
+      this.ctx.storage.sql.exec(`
+        INSERT INTO browser_trace_admissions
+          (token, trace_id, issued_at, expires_at, remaining_batches)
+        VALUES (?, ?, ?, ?, ?)
+      `, parsed.data.token, parsed.data.traceId, now, now + PUBLIC_TRACE_ADMISSION_TTL_MS,
+      PUBLIC_TRACE_ADMISSION_BATCH_LIMIT);
+      return { issued: true, recordRejection: false };
+    });
+    const observability = this.publicObservabilityStore();
+    if (decision.issued) {
+      observability.recordSamplingDecision(now, true);
+      observability.markDirty();
+      await this.scheduleNextAlarm(now);
+    } else if (decision.recordRejection) {
+      observability.recordSamplingDecision(now, false);
+      observability.recordDroppedTraces(now);
+      observability.markDirty();
+      await this.scheduleNextAlarm(now);
+    }
+    return new Response(null, {
+      headers: decision.issued
+        ? { "cache-control": "no-store" }
+        : budgetExceededHeaders(now, PUBLIC_TELEMETRY_BUDGET.rootTraces.requests),
+      status: decision.issued ? 201 : 429,
+    });
+  }
+
+  private deleteExpiredAdmissions(now: number): void {
+    this.ctx.storage.sql.exec("DELETE FROM browser_trace_admissions WHERE expires_at < ?", now);
+  }
+
+  private async traceSnapshot(request: Request): Promise<Response> {
+    const now = Date.now();
+    if (!this.publicRequestBudgetStore().tryConsume(
+      "snapshot",
+      PUBLIC_TELEMETRY_BUDGET.snapshots.requests,
+      now,
+    )) return budgetExceededResponse(now, PUBLIC_TELEMETRY_BUDGET.snapshots.requests);
+    return tracing.enterSpan("durable-object.snapshot", async (nativeSpan) => {
+      nativeSpan.setAttribute("app.telemetry.operation_class", "snapshot");
+      const started = startPublicSpan(request.headers.get("traceparent"), Date.now());
+      const response = new URL(request.url).pathname === "/api/observability/snapshot"
+        ? await this.observabilitySnapshot()
+        : await this.snapshot();
+      await this.recordRuntimeSpan(finishDurableObjectSpan(
+        "snapshot",
+        started,
+        response.status,
+        Date.now(),
+      ));
+      return response;
+    });
+  }
+
+  private async traceStreamConnect(request: Request): Promise<Response> {
+    return tracing.enterSpan("durable-object.stream-connect", async (nativeSpan) => {
+      nativeSpan.setAttribute("app.telemetry.operation_class", "stream-connect");
+      const started = startPublicSpan(request.headers.get("traceparent"), Date.now());
+      const response = await this.connectWebSocket(request);
+      if (shouldRecordPublicRuntimeSpan(response.status)) {
+        await this.recordRuntimeSpan(finishDurableObjectSpan(
+          "stream-connect",
+          started,
+          response.status,
+          Date.now(),
+        ));
+      }
+      return response;
+    });
+  }
+
+  private async recordRuntimeSpan(span: PublicSpan): Promise<void> {
+    const now = Date.now();
+    const result = this.ctx.storage.transactionSync(() => ingestPublicSpanBatch(
+      PUBLIC_TRACE_STREAM,
+      this.publicTraceStore(),
+      [span],
+      now,
+    ));
+    this.recordObservabilityIngestResult(result, now);
+    await this.scheduleNextAlarm(now);
   }
 
   private async record(request: Request): Promise<Response> {
@@ -305,23 +603,49 @@ export class TailLatencyRoom extends DurableObject<Env> {
     });
   }
 
+  private async observabilitySnapshot(): Promise<Response> {
+    const now = Date.now();
+    await this.refreshObservabilityForRead(now);
+    const projection = this.publicObservabilityStore().readCurrent()
+      ?? projectPublicObservability([], 0, now);
+    return Response.json(projection, {
+      headers: {
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff",
+      },
+    });
+  }
+
   private async connectWebSocket(request: Request): Promise<Response> {
-    await this.refreshForRead(Date.now());
     const url = new URL(request.url);
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
       return new Response("Expected a WebSocket upgrade", { status: 426 });
     }
     const streams = url.searchParams.get("streams")?.split(",") ?? [];
-    if (streams.length !== 1 || streams[0] !== STREAM_NAME) {
+    const stream = streams[0];
+    if (streams.length !== 1 || (stream !== STREAM_NAME && stream !== OBSERVABILITY_STREAM_NAME)) {
       return new Response("Unknown or disallowed public stream", { status: 400 });
     }
+    const now = Date.now();
+    if (!hasPublicWebSocketCapacity(this.ctx.getWebSockets().length) ||
+        !this.publicRequestBudgetStore().tryConsume(
+          "websocket",
+          PUBLIC_TELEMETRY_BUDGET.webSockets.requests,
+          now,
+        )) return budgetExceededResponse(now, PUBLIC_TELEMETRY_BUDGET.webSockets.requests);
+    if (stream === OBSERVABILITY_STREAM_NAME) await this.refreshObservabilityForRead(Date.now());
+    else await this.refreshForRead(Date.now());
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
-    this.ctx.acceptWebSocket(server, [STREAM_NAME]);
-    server.serializeAttachment({ streams: [STREAM_NAME] });
+    this.ctx.acceptWebSocket(server, [stream]);
+    server.serializeAttachment({ streams: [stream] });
 
     const since = parseSequence(url.searchParams.get("since"));
+    if (stream === OBSERVABILITY_STREAM_NAME) {
+      this.recoverObservabilitySocket(server, since);
+      return new Response(null, { status: 101, webSocket: client });
+    }
     const bounds = this.ctx.storage.sql.exec<ReplayBoundsRow>(
       "SELECT MIN(sequence) AS oldest_sequence FROM replay",
     ).toArray()[0];
@@ -342,6 +666,34 @@ export class TailLatencyRoom extends DurableObject<Env> {
       }
     }
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  private recoverObservabilitySocket(server: WebSocket, since: number): void {
+    const store = this.publicObservabilityStore();
+    const mode = selectRecoveryMode(since, store.oldestReplaySequence());
+    const replay = mode === "replay" ? store.replayAfter(since) : [];
+    if (!replay || replay.length === 0) {
+      const current = store.readCurrent();
+      if (current) server.send(JSON.stringify(observabilityEnvelope(current)));
+      return;
+    }
+    for (const projection of replay) {
+      server.send(JSON.stringify(observabilityEnvelope(projection)));
+    }
+  }
+
+  private async refreshObservabilityForRead(now: number): Promise<void> {
+    const store = this.publicObservabilityStore();
+    if (this.maintainPublicTraces(now)) store.markDirty();
+    const retention = store.enforceRetention(now);
+    if (retention.dropBucketsDeleted > 0 || retention.samplingBucketsDeleted > 0) store.markDirty();
+    const currentMissing = store.readCurrent() === null;
+    if (currentMissing) store.markDirty();
+    const publishAt = store.nextPublishAt(now);
+    if (currentMissing || (publishAt !== null && publishAt <= now)) {
+      this.publishObservability(now);
+    }
+    await this.scheduleNextAlarm(now);
   }
 
   private async refreshForRead(now: number): Promise<void> {
@@ -373,7 +725,22 @@ export class TailLatencyRoom extends DurableObject<Env> {
       samples.map((sample) => ({ observedAt: sample.observed_at })),
       now,
     );
-    const candidates = [cadenceAt, expiryAt].filter((candidate): candidate is number => candidate !== null);
+    const traceStore = this.publicTraceStore();
+    const traceAlarmAt = nextTraceStoreAlarm(
+      PUBLIC_TRACE_STREAM,
+      traceStore.nextFinalizeAt(),
+      traceStore.oldestFirstSeenAt(),
+    );
+    const observabilityPublishAt = this.publicObservabilityStore().nextPublishAt(now);
+    const observabilityExpiryAt = this.publicObservabilityStore().nextExpiryAt();
+    const candidates = [
+      cadenceAt,
+      expiryAt,
+      traceAlarmAt,
+      observabilityPublishAt,
+      observabilityExpiryAt,
+    ]
+      .filter((candidate): candidate is number => candidate !== null);
     const scheduledAlarmAt = await this.ctx.storage.getAlarm();
     if (candidates.length === 0) {
       if (scheduledAlarmAt !== null) await this.ctx.storage.deleteAlarm();
@@ -382,6 +749,74 @@ export class TailLatencyRoom extends DurableObject<Env> {
     const desiredAlarmAt = Math.min(...candidates);
     if (scheduledAlarmAt === null || Math.abs(scheduledAlarmAt - desiredAlarmAt) >= 1) {
       await this.ctx.storage.setAlarm(desiredAlarmAt);
+    }
+  }
+
+  private maintainPublicTraces(now: number): boolean {
+    const result = this.ctx.storage.transactionSync(() => {
+      const store = this.publicTraceStore();
+      const finalized = finalizeDueTraces(store, now);
+      const retention = enforceWholeTraceRetention(PUBLIC_TRACE_STREAM, store, now);
+      return { finalized, retention };
+    });
+    if (result.finalized.invalidTracesDeleted > 0) {
+      this.publicObservabilityStore().recordDroppedTraces(
+        now,
+        result.finalized.invalidTracesDeleted,
+      );
+    }
+    return result.finalized.finalized > 0
+      || result.finalized.invalidTracesDeleted > 0
+      || result.retention.tracesDeleted > 0;
+  }
+
+  private publicTraceStore(): SqlPublicTraceStore {
+    return new SqlPublicTraceStore(cloudflareTraceSql(this.ctx.storage.sql));
+  }
+
+  private publicObservabilityStore(): SqlPublicObservabilityStore {
+    return new SqlPublicObservabilityStore(
+      cloudflareTraceSql(this.ctx.storage.sql),
+      PUBLIC_TRACE_STREAM,
+    );
+  }
+
+  private publicRequestBudgetStore(): SqlPublicRequestBudgetStore {
+    return new SqlPublicRequestBudgetStore(cloudflareTraceSql(this.ctx.storage.sql));
+  }
+
+  private publishObservabilityIfDue(now: number): void {
+    const publishAt = this.publicObservabilityStore().nextPublishAt(now);
+    if (publishAt !== null && publishAt <= now) this.publishObservability(now);
+  }
+
+  private publishObservability(now: number): void {
+    const store = this.publicObservabilityStore();
+    const sampling = store.samplingWindow(now);
+    const projection = projectPublicObservability(
+      this.publicTraceStore().readFinalizedTraces(),
+      store.nextSequence(),
+      now,
+      {
+        droppedTraceCount: store.droppedTraceCount(now),
+        droppedTraceExpiresAtUnixMs: store.nextDropExpiryAt(),
+        sampleRate: sampling.sampleRate,
+        samplingExpiresAtUnixMs: store.nextSamplingExpiryAt(),
+      },
+    );
+    this.ctx.storage.transactionSync(() => store.publish(projection));
+    const message = JSON.stringify(observabilityEnvelope(projection));
+    for (const socket of this.ctx.getWebSockets(OBSERVABILITY_STREAM_NAME)) {
+      try { socket.send(message); } catch { socket.close(1011, "Projection delivery failed"); }
+    }
+  }
+
+  private recordObservabilityIngestResult(result: PublicSpanBatchResult, now: number): void {
+    const dropped = result.invalidTracesDeleted + result.oversizedTracesDeleted;
+    if (result.finalized > 0 || dropped > 0 || result.retention.tracesDeleted > 0) {
+      const store = this.publicObservabilityStore();
+      if (dropped > 0) store.recordDroppedTraces(now, dropped);
+      store.markDirty();
     }
   }
 
@@ -414,6 +849,16 @@ export class TailLatencyRoom extends DurableObject<Env> {
 
 function envelope(projection: TailLatencyProjection): StreamEnvelope {
   return { projection, stream: STREAM_NAME, type: "projection" };
+}
+
+function observabilityEnvelope(
+  projection: PublicObservabilityProjection,
+) {
+  return publicObservabilityEnvelopeSchema.parse({
+    projection,
+    stream: OBSERVABILITY_STREAM_NAME,
+    type: "projection",
+  });
 }
 
 function fromCurrentRow(row: CurrentProjectionRow | undefined) {
@@ -469,6 +914,227 @@ function retentionStore(sql: SqlStorage): PublicStreamRetentionStore {
   };
 }
 
+function cloudflareTraceSql(sql: SqlStorage): TraceSql {
+  return {
+    exec<Row>(query: string, ...bindings: TraceSqlValue[]): TraceSqlCursor<Row> {
+      const cursor = sql.exec(query, ...bindings);
+      return {
+        rowsWritten: cursor.rowsWritten,
+        toArray: () => cursor.toArray() as Row[],
+      };
+    },
+  };
+}
+
+async function tracePublicApiRequest(
+  operation: Exclude<PublicServerOperation, "article">,
+  request: Request,
+  room: DurableObjectStub<TailLatencyRoom>,
+  context: ExecutionContext,
+): Promise<Response> {
+  return context.tracing.enterSpan(`worker.${operation}-request`, async (nativeSpan) => {
+    nativeSpan.setAttribute("app.telemetry.route_class", operation);
+    const browserParent = request.headers.get("traceparent")
+      ?? (operation === "stream" ? new URL(request.url).searchParams.get("traceparent") : null);
+    const started = startPublicSpan(browserParent, Date.now());
+    const response = await room.fetch(withTraceparent(request, started.traceparent, operation === "stream"));
+    nativeSpan.setAttribute("http.response.status_code", response.status);
+    if (shouldRecordPublicRuntimeSpan(response.status)) {
+      context.waitUntil(recordPublicRuntimeSpan(
+        room,
+        finishWorkerSpan(operation, started, response.status, Date.now()),
+      ));
+    }
+    return response;
+  });
+}
+
+async function ingestPublicOtlpRequest(
+  request: Request,
+  room: DurableObjectStub<TailLatencyRoom>,
+): Promise<Response> {
+  if (request.headers.get("content-type")?.split(";", 1)[0] !== "application/json") {
+    return new Response("Expected OTLP/HTTP JSON", { status: 415 });
+  }
+  const payload = await readBoundedJson(request, PUBLIC_TELEMETRY_BUDGET.intake.maxPayloadBytes);
+  if (payload === null) return new Response("Invalid or oversized OTLP payload", { status: 400 });
+  const spans = parsePublicOtlpJson(payload);
+  if (spans === null) return new Response("Disallowed OTLP span batch", { status: 400 });
+  const admissionToken = request.headers.get(PUBLIC_TRACE_ADMISSION_HEADER);
+  if (!admissionToken) return new Response("Missing trace admission", { status: 403 });
+
+  const stored = await recordPublicBrowserSpans(room, admissionToken, spans);
+  const storageFailure = publicIntakeStorageFailure(stored);
+  if (storageFailure) return storageFailure;
+  return Response.json({}, {
+    headers: { "cache-control": "no-store", "x-content-type-options": "nosniff" },
+  });
+}
+
+async function traceArticleRequest(
+  request: Request,
+  url: URL,
+  env: Env,
+  room: DurableObjectStub<TailLatencyRoom>,
+  context: ExecutionContext,
+): Promise<Response> {
+  return context.tracing.enterSpan("worker.article-request", async (nativeSpan) => {
+    nativeSpan.setAttribute("app.telemetry.route_class", "article");
+    const startedAt = performance.now();
+    const publicStarted = url.pathname === OBSERVABILITY_ARTICLE_PATH
+      ? startPublicSpan(null, Date.now())
+      : null;
+    let response = await env.ASSETS.fetch(request);
+
+    if (publicStarted) {
+      const admissionToken = crypto.randomUUID().replaceAll("-", "");
+      let admitted = false;
+      try {
+        admitted = await issueBrowserTraceAdmission(
+          room,
+          admissionToken,
+          publicStarted.context.traceId,
+        );
+      } catch {
+        // Telemetry is optional; the static article and embedded fallback remain primary.
+      }
+      if (admitted) {
+        response = injectBrowserTraceContext(response, publicStarted.traceparent, admissionToken);
+        context.waitUntil(recordPublicRuntimeSpan(
+          room,
+          finishWorkerSpan("article", publicStarted, response.status, Date.now()),
+        ));
+      }
+    }
+
+    const sample = {
+      durationMs: Math.min(60_000, Math.max(0, performance.now() - startedAt)),
+      observedAt: Date.now(),
+      routeClass: "article",
+      statusClass: classifyStatus(response.status),
+    } satisfies PublicTimingSample;
+    context.waitUntil(room.fetch(new Request("https://tail-latency.internal/record", {
+      body: JSON.stringify(sample),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    })));
+    nativeSpan.setAttribute("http.response.status_code", response.status);
+    return withSecurityHeaders(response, url);
+  });
+}
+
+function recordPublicRuntimeSpan(
+  room: DurableObjectStub<TailLatencyRoom>,
+  span: PublicSpan,
+): Promise<Response> {
+  return recordPublicRuntimeSpans(room, [span]);
+}
+
+function recordPublicRuntimeSpans(
+  room: DurableObjectStub<TailLatencyRoom>,
+  spans: readonly PublicSpan[],
+): Promise<Response> {
+  return room.fetch(new Request("https://observability.internal/public-spans", {
+    body: JSON.stringify(spans),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  }));
+}
+
+function recordPublicBrowserSpans(
+  room: DurableObjectStub<TailLatencyRoom>,
+  admissionToken: string,
+  spans: readonly PublicSpan[],
+): Promise<Response> {
+  return room.fetch(new Request("https://observability.internal/public-browser-spans", {
+    body: JSON.stringify(spans),
+    headers: {
+      "content-type": "application/json",
+      [PUBLIC_TRACE_ADMISSION_HEADER]: admissionToken,
+    },
+    method: "POST",
+  }));
+}
+
+async function issueBrowserTraceAdmission(
+  room: DurableObjectStub<TailLatencyRoom>,
+  token: string,
+  traceId: string,
+): Promise<boolean> {
+  const response = await room.fetch(new Request("https://observability.internal/public-trace-admissions", {
+    body: JSON.stringify({ token, traceId }),
+    headers: { "content-type": "application/json" },
+    method: "POST",
+  }));
+  return response.status === 201;
+}
+
+async function readBoundedJson(request: Request, maxBytes: number): Promise<unknown | null> {
+  if (!request.body) return null;
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      totalBytes += chunk.value.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel("OTLP payload exceeds the public intake limit");
+        return null;
+      }
+      chunks.push(chunk.value);
+    }
+    const body = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      body.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body)) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function withTraceparent(request: Request, traceparent: string, stripQueryContext: boolean): Request {
+  const headers = new Headers(request.headers);
+  headers.set("traceparent", traceparent);
+  if (!stripQueryContext) return new Request(request, { headers });
+  const url = new URL(request.url);
+  url.searchParams.delete("traceparent");
+  return new Request(url, { headers, method: request.method });
+}
+
+function injectBrowserTraceContext(
+  response: Response,
+  traceparent: string,
+  admissionToken: string,
+): Response {
+  if (!response.headers.get("content-type")?.startsWith("text/html")) return response;
+  const transformed = new HTMLRewriter()
+    .on("head", {
+      element(element) {
+        element.prepend(
+          `<meta name="traceparent" content="${traceparent}"><meta name="public-trace-admission" content="${admissionToken}">`,
+          { html: true },
+        );
+      },
+    })
+    .transform(response);
+  const uncached = new Response(transformed.body, transformed);
+  uncached.headers.set("cache-control", "no-store");
+  return uncached;
+}
+
+function serverOperation(pathname: string): Exclude<PublicServerOperation, "article"> | null {
+  if (pathname === "/api/tail-latency/snapshot" || pathname === "/api/observability/snapshot") {
+    return "snapshot";
+  }
+  if (pathname === "/api/stream") return "stream";
+  return null;
+}
+
 function classifyRoute(pathname: string): PublicTimingSample["routeClass"] {
   if (pathname === "/") return "home";
   if (pathname.startsWith("/posts/")) return "article";
@@ -490,6 +1156,20 @@ function parseSequence(raw: string | null): number {
 
 function parseStoredJson(payload: string): unknown {
   try { return JSON.parse(payload) as unknown; } catch { return null; }
+}
+
+function budgetExceededResponse(now: number, budget: FixedWindowBudget): Response {
+  return new Response("Optional telemetry budget reached", {
+    headers: budgetExceededHeaders(now, budget),
+    status: 429,
+  });
+}
+
+function budgetExceededHeaders(now: number, budget: FixedWindowBudget): HeadersInit {
+  return {
+    "cache-control": "no-store",
+    "retry-after": String(retryAfterSeconds(now, budget)),
+  };
 }
 
 async function parseRequestJson(request: Request): Promise<unknown> {

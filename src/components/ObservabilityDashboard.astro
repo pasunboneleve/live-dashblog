@@ -1,0 +1,148 @@
+---
+import { STATIC_OBSERVABILITY_PROJECTION } from "../domain/public-observability";
+import { createWaterfallGeometry } from "../visualizations/observability-geometry";
+
+const projection = STATIC_OBSERVABILITY_PROJECTION;
+const selectedTrace = projection.slowTraces[0] ?? null;
+const waterfall = createWaterfallGeometry(selectedTrace);
+const heatMaximum = Math.max(1, ...projection.heatmap.map((bucket) => bucket.count));
+const runtimeMaximum = Math.max(1, ...projection.aggregates.byRuntimeSide.map((group) => group.count));
+
+function milliseconds(value: number): string {
+  return value < 10 ? value.toFixed(1) : Math.round(value).toString();
+}
+
+function percent(value: number): string {
+  return `${(value * 100).toFixed(value > 0 && value < 0.1 ? 1 : 0)}%`;
+}
+---
+
+<section class="observability not-prose my-14" data-observability data-projection={JSON.stringify(projection)} aria-labelledby="observability-title">
+  <header class="panel-heading">
+    <div>
+      <p class="eyebrow">This page · rolling five-minute trace window</p>
+      <h2 id="observability-title">What just happened, joined end to end</h2>
+    </div>
+    <p class="connection" data-sequence>embedded trace</p>
+  </header>
+
+  <div class="summary" aria-live="polite">
+    <div><span>traces</span><strong data-trace-count>{projection.traceCount}</strong></div>
+    <div><span>spans</span><strong data-span-count>{projection.spanCount}</strong></div>
+    <div><span>errors</span><strong data-error-rate>{percent(projection.aggregates.overall.errorRate)}</strong></div>
+    <div><span>p50</span><strong data-p50>{milliseconds(projection.aggregates.overall.p50Ms)} ms</strong></div>
+    <div><span>p95</span><strong data-p95>{milliseconds(projection.aggregates.overall.p95Ms)} ms</strong></div>
+    <div><span>max</span><strong data-max>{milliseconds(projection.aggregates.overall.maxMs)} ms</strong></div>
+  </div>
+
+  <div class="detail-grid">
+    <section aria-labelledby="runtime-title">
+      <h3 id="runtime-title">Runtime sides</h3>
+      <div class="runtime-groups">
+        {projection.aggregates.byRuntimeSide.map((group) => (
+          <div class="runtime-row" data-runtime={group.key}>
+            <div><strong>{group.key}</strong><span data-runtime-count>{group.count} spans · {percent(group.errorRate)} errors</span></div>
+            <meter min="0" max={runtimeMaximum} value={group.count}>{group.count}</meter>
+          </div>
+        ))}
+      </div>
+    </section>
+
+    <section aria-labelledby="heatmap-title">
+      <h3 id="heatmap-title">Duration distribution</h3>
+      <div class="heatmap" aria-label="Span duration histogram">
+        {projection.heatmap.map((bucket, index) => {
+          const intensity = Math.ceil(bucket.count / heatMaximum * 5);
+          return <span
+            class={`heat-cell heat-${intensity}`}
+            data-heat-index={index}
+            title={`${bucket.count} spans from ${bucket.lowerBoundMs} to ${bucket.upperBoundMs} milliseconds`}
+          >{bucket.count}</span>;
+        })}
+      </div>
+      <div class="heat-labels" aria-hidden="true"><span>0 ms</span><span>60 s</span></div>
+    </section>
+  </div>
+
+  <section class="waterfall-section" aria-labelledby="waterfall-title">
+    <div class="waterfall-heading">
+      <div><h3 id="waterfall-title">Slow traces</h3><p data-sampling>{percent(projection.sampling.sampleRate)} admitted · {projection.sampling.droppedTraceCount} dropped</p></div>
+      <div class="trace-choices" data-trace-choices aria-label="Select a slow trace">
+        {projection.slowTraces.map((trace, index) => (
+          <button type="button" data-trace-id={trace.traceId} aria-pressed={index === 0 ? "true" : "false"}>
+            {milliseconds(trace.durationMs)} ms{trace.error ? " · error" : ""}
+          </button>
+        ))}
+      </div>
+    </div>
+    <p class="empty" data-empty hidden={selectedTrace !== null}>No complete traces remain in the current five-minute window.</p>
+    <svg data-waterfall viewBox={waterfall.viewBox} role="img" aria-labelledby="waterfall-svg-title waterfall-svg-description">
+      <title id="waterfall-svg-title">Joined browser, Worker, and Durable Object spans</title>
+      <desc id="waterfall-svg-description" data-waterfall-description>{selectedTrace ? `${selectedTrace.spans.length} joined spans across ${milliseconds(selectedTrace.durationMs)} milliseconds.` : "No complete traces remain in the current five-minute window."}</desc>
+      <g data-waterfall-rows>
+        {waterfall.spans.map((span) => (
+          <g data-span-id={span.spanId}>
+            <text x="0" y={span.y + 12}>{span.label}</text>
+            <rect class={`span-bar ${span.runtimeSide}`} x={span.x} y={span.y} width={span.barWidth} height="16"></rect>
+          </g>
+        ))}
+      </g>
+    </svg>
+  </section>
+
+  <p class="footnote">Only allowlisted operation names, runtime classes, status, duration, and trace relationships reach this view. Intake and rendering do not observe themselves.</p>
+</section>
+
+<script>
+  import { mountObservability } from "../visualizations/observability";
+  document.querySelectorAll<HTMLElement>("[data-observability]").forEach(mountObservability);
+</script>
+
+<style>
+  .observability { border: 1px solid var(--line); border-radius: 0.75rem; overflow: hidden; background: color-mix(in srgb, var(--surface) 94%, black); }
+  .panel-heading, .waterfall-heading { display: flex; align-items: start; justify-content: space-between; gap: 1.5rem; padding: 1.25rem 1.35rem; }
+  .eyebrow, .connection, .waterfall-heading p { margin: 0; color: var(--cyan); font-size: 0.68rem; letter-spacing: 0.14em; text-transform: uppercase; }
+  h2, h3 { margin: 0.28rem 0 0; color: var(--ink); font-weight: 550; letter-spacing: -0.025em; }
+  h2 { font-size: 1.35rem; } h3 { font-size: 1rem; }
+  .summary { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); border-block: 1px solid var(--line); }
+  .summary div { padding: 1rem 1.1rem; border-right: 1px solid var(--line); }
+  .summary div:last-child { border-right: 0; }
+  .summary span, .runtime-row span { display: block; color: var(--muted); font-size: 0.68rem; letter-spacing: 0.12em; text-transform: uppercase; }
+  .summary strong { display: block; margin-top: 0.35rem; color: var(--ink); font-size: 1.35rem; }
+  .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; padding: 1.35rem; border-bottom: 1px solid var(--line); }
+  .runtime-groups { display: grid; gap: 0.85rem; margin-top: 1rem; }
+  .runtime-row div { display: flex; justify-content: space-between; gap: 1rem; }
+  .runtime-row strong { color: var(--ink); font-size: 0.82rem; }
+  meter { width: 100%; height: 0.45rem; accent-color: var(--cyan); }
+  .heatmap { display: grid; grid-template-columns: repeat(10, 1fr); gap: 0.25rem; margin-top: 1rem; }
+  .heat-cell { display: grid; min-height: 2.8rem; place-items: center; border-radius: 0.2rem; color: var(--ink); font-size: 0.72rem; }
+  .heat-0 { background: color-mix(in srgb, var(--surface) 80%, black); color: var(--muted); }
+  .heat-1 { background: color-mix(in srgb, var(--cyan) 12%, var(--surface)); }
+  .heat-2 { background: color-mix(in srgb, var(--cyan) 24%, var(--surface)); }
+  .heat-3 { background: color-mix(in srgb, var(--cyan) 38%, var(--surface)); }
+  .heat-4 { background: color-mix(in srgb, var(--cyan) 56%, var(--surface)); }
+  .heat-5 { background: color-mix(in srgb, var(--cyan) 76%, var(--surface)); color: #061012; }
+  .heat-labels { display: flex; justify-content: space-between; margin-top: 0.35rem; color: var(--muted); font-size: 0.65rem; }
+  .waterfall-section { padding-bottom: 1rem; }
+  .waterfall-heading { padding-bottom: 0.7rem; }
+  .trace-choices { display: flex; flex-wrap: wrap; justify-content: end; gap: 0.4rem; }
+  .observability :global(button) { border: 1px solid var(--line); border-radius: 999px; padding: 0.4rem 0.65rem; background: transparent; color: var(--muted); font: inherit; font-size: 0.72rem; cursor: pointer; }
+  .observability :global(button[aria-pressed="true"]) { border-color: var(--amber); color: var(--ink); }
+  svg { display: block; width: 100%; min-height: 9rem; padding-inline: 1.35rem; overflow: visible; }
+  .observability :global(text) { fill: var(--muted); font-size: 10px; }
+  .observability :global(.span-bar) { rx: 3px; }
+  .observability :global(.span-bar.browser) { fill: var(--cyan); }
+  .observability :global(.span-bar.worker) { fill: var(--amber); }
+  .observability :global(.span-bar.durable-object) { fill: #a78bfa; }
+  .empty, .footnote { color: var(--muted); font-size: 0.75rem; }
+  .empty { padding: 1rem 1.35rem; }
+  .footnote { margin: 0; padding: 1rem 1.35rem 0; border-top: 1px solid var(--line); }
+  @media (max-width: 760px) {
+    .panel-heading, .waterfall-heading { display: block; }
+    .connection, .trace-choices { margin-top: 0.8rem; justify-content: start; }
+    .summary { grid-template-columns: repeat(3, 1fr); }
+    .summary div:nth-child(3) { border-right: 0; }
+    .summary div:nth-child(-n + 3) { border-bottom: 1px solid var(--line); }
+    .detail-grid { grid-template-columns: 1fr; }
+  }
+</style>

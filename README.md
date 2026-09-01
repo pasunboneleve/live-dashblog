@@ -4,18 +4,20 @@
 
 Live Dashblog is a cost-restrained instrumented-essay blog. Astro publishes ordinary Markdown or MDX, while each post may import a purpose-built TypeScript visualization fed by a privacy-bounded projection of the Worker serving the site.
 
-The first slice explains tail latency with a rolling 60-second request line. It is a local scaffold: no Cloudflare or Bitwarden account has been accessed, and no resource has been deployed.
+The runtime post now explains its own request with joined browser, Worker, and Durable Object spans. It derives bounded Honeycomb-like aggregates, a duration heatmap, and trace waterfalls from a five-minute SQLite window. The development-metrics post remains planned.
 
 ## Architecture at a glance
 
 ```text
-static Astro article + Worker request timing
-  -> typed reducer
-  -> bounded SQLite Durable Object projection
-  -> one hibernating page WebSocket with a keyed stream envelope
+Astro article + Worker-issued trace admission
+  -> browser, Worker, and Durable Object OpenTelemetry spans
+  -> strict same-origin OTLP boundary
+  -> bounded whole-trace SQLite Durable Object
+  -> aggregate, heatmap, and waterfall projection replay
+  -> one hibernating page WebSocket
   -> latest projection buffer
   -> requestAnimationFrame
-  -> persistent SVG line, area, and latest-point marker
+  -> persistent keyed DOM and SVG
 ```
 
 ## Quick start
@@ -25,7 +27,7 @@ npm install
 npm run dev
 ```
 
-Astro serves the static authoring view at `http://localhost:4321`. To exercise the Worker, Durable Object, and WebSocket locally, run `npm run dev:worker` and open the Wrangler URL instead. See [local development](docs/development.md).
+Astro serves the embedded authoring view at `http://localhost:4321`. To exercise joined traces, the Durable Object, and WebSocket replay locally, run `npm run dev:worker` and open `/posts/observability/` on the Wrangler URL. See [local development](docs/development.md).
 
 For a supervised live review that rebuilds Astro and reloads the Worker-served page as files change:
 
@@ -59,4 +61,4 @@ npm run check
 
 ## Status
 
-One vertical slice is implemented. The domain core has deterministic tests, and the repository contains separate review and main-only deployment workflows. Cloudflare deployment and live-account checks remain intentionally unperformed.
+The Cloudflare scaffold is live on workers.dev, while the recursive observability implementation and its launch traffic ceilings are currently validated locally and await their normal review and deployment path. Cost notifications, the complete production smoke test, and the deployment-time development-metrics post remain open.
