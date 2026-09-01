@@ -8,8 +8,11 @@ import {
 import { PUBLIC_TRACE_STREAM } from "./public-trace-store";
 
 export const OBSERVABILITY_STREAM_NAME = "observability";
-export const OBSERVABILITY_PROJECTION_VERSION = 1;
-export const MAX_PROJECTED_SLOW_TRACES = 5;
+export const OBSERVABILITY_PROJECTION_VERSION = 2;
+export const OBSERVABILITY_BUCKET_DURATION_MS = 10_000;
+export const OBSERVABILITY_BUCKET_COUNT = 30;
+export const MAX_OBSERVABILITY_BUCKET_COUNT = OBSERVABILITY_BUCKET_COUNT + 1;
+export const MAX_PROJECTED_TRACE_SAMPLES = 12;
 
 const serviceNameSchema = z.enum([
   "live-dashblog-browser",
@@ -35,6 +38,14 @@ const waterfallSpanSchema = z.object({
   spanId: z.string(),
   status: z.enum(["unset", "ok", "error"]),
 }).strict();
+const traceSampleSchema = z.object({
+  error: z.boolean(),
+  observedWindowMs: z.number().nonnegative(),
+  requestDurationMs: z.number().nonnegative(),
+  spans: z.array(waterfallSpanSchema).max(16),
+  requestStartedAtUnixMs: z.number().int().nonnegative(),
+  traceId: z.string(),
+}).strict();
 
 export const publicObservabilityProjectionSchema = z.object({
   aggregates: z.object({
@@ -44,7 +55,7 @@ export const publicObservabilityProjectionSchema = z.object({
   }).strict(),
   dataExpiresAtUnixMs: z.number().int().nonnegative().nullable(),
   generatedAt: z.number().int().nonnegative(),
-  heatmap: z.array(z.object({
+  durationBands: z.array(z.object({
     count: z.number().int().nonnegative(),
     lowerBoundMs: z.number().nonnegative(),
     upperBoundMs: z.number().positive(),
@@ -55,13 +66,19 @@ export const publicObservabilityProjectionSchema = z.object({
     sampleRate: z.number().min(0).max(1),
   }).strict(),
   sequence: z.number().int().nonnegative(),
-  slowTraces: z.array(z.object({
-    durationMs: z.number().nonnegative(),
-    error: z.boolean(),
-    spans: z.array(waterfallSpanSchema).max(16),
-    startedAtUnixMs: z.number().int().nonnegative(),
-    traceId: z.string(),
-  }).strict()).max(MAX_PROJECTED_SLOW_TRACES),
+  timeSeries: z.object({
+    bucketDurationMs: z.literal(OBSERVABILITY_BUCKET_DURATION_MS),
+    buckets: z.array(z.object({
+      endUnixMs: z.number().int().nonnegative(),
+      errorCount: z.number().int().nonnegative(),
+      requestMaxMs: z.number().nonnegative(),
+      requestP95Ms: z.number().nonnegative(),
+      sampleTraceIds: z.array(z.string()).max(MAX_PROJECTED_TRACE_SAMPLES),
+      startUnixMs: z.number().int().nonnegative(),
+      traceCount: z.number().int().nonnegative(),
+    }).strict()).min(1).max(MAX_OBSERVABILITY_BUCKET_COUNT),
+  }).strict(),
+  traceSamples: z.array(traceSampleSchema).max(MAX_PROJECTED_TRACE_SAMPLES),
   spanCount: z.number().int().nonnegative(),
   stream: z.literal(OBSERVABILITY_STREAM_NAME),
   traceCount: z.number().int().nonnegative(),
@@ -84,7 +101,7 @@ interface ProjectionSampling {
   samplingExpiresAtUnixMs?: number | null;
 }
 
-const HEATMAP_EDGES_MS = Object.freeze([0, 5, 10, 25, 50, 100, 250, 500, 1_000, 5_000, 60_001]);
+const SPAN_DURATION_EDGES_MS = Object.freeze([0, 5, 10, 25, 50, 100, 250, 500, 1_000, 5_000, 60_001]);
 
 /** Reduces finalized whole traces into the complete browser-safe observability view. */
 export function projectPublicObservability(
@@ -94,6 +111,7 @@ export function projectPublicObservability(
   sampling: ProjectionSampling = { droppedTraceCount: 0, sampleRate: 1 },
 ): PublicObservabilityProjection {
   const completeTraces = traces.filter((trace) => trace.length > 0);
+  const projectedTraces = completeTraces.map(projectTrace);
   const spans = completeTraces.flat();
   const traceExpiryAt = completeTraces.length === 0
     ? null
@@ -119,8 +137,8 @@ export function projectPublicObservability(
     },
     dataExpiresAtUnixMs: expiryCandidates.length === 0 ? null : Math.min(...expiryCandidates),
     generatedAt,
-    heatmap: HEATMAP_EDGES_MS.slice(0, -1).map((lowerBoundMs, index) => {
-      const upperBoundMs = HEATMAP_EDGES_MS[index + 1]!;
+    durationBands: SPAN_DURATION_EDGES_MS.slice(0, -1).map((lowerBoundMs, index) => {
+      const upperBoundMs = SPAN_DURATION_EDGES_MS[index + 1]!;
       return {
         count: spans.filter((span) =>
           span.durationMs >= lowerBoundMs && span.durationMs < upperBoundMs
@@ -135,10 +153,10 @@ export function projectPublicObservability(
       sampleRate: sampling.sampleRate,
     },
     sequence,
-    slowTraces: completeTraces
-      .map(projectWaterfall)
-      .sort((left, right) => right.durationMs - left.durationMs || left.traceId.localeCompare(right.traceId))
-      .slice(0, MAX_PROJECTED_SLOW_TRACES),
+    timeSeries: projectTimeSeries(projectedTraces, generatedAt),
+    traceSamples: projectedTraces
+      .sort(compareTraceInterest)
+      .slice(0, MAX_PROJECTED_TRACE_SAMPLES),
     spanCount: spans.length,
     stream: OBSERVABILITY_STREAM_NAME,
     traceCount: completeTraces.length,
@@ -191,12 +209,17 @@ function groupedAggregates<Key extends string>(
   return keys.map((key) => ({ key, ...aggregate(spans.filter((span) => keyFor(span) === key)) }));
 }
 
-function projectWaterfall(trace: readonly PublicSpan[]) {
+function projectTrace(trace: readonly PublicSpan[]) {
   const startedAtUnixMs = Math.min(...trace.map((span) => span.startedAtUnixMs));
   const endedAtUnixMs = Math.max(...trace.map((span) => span.startedAtUnixMs + span.durationMs));
+  const rootSpan = [...trace]
+    .sort((left, right) => left.startedAtUnixMs - right.startedAtUnixMs || left.spanId.localeCompare(right.spanId))
+    .find((span) => span.parentSpanId === null) ?? trace[0]!;
   return {
-    durationMs: endedAtUnixMs - startedAtUnixMs,
     error: trace.some((span) => span.status === "error"),
+    observedWindowMs: endedAtUnixMs - startedAtUnixMs,
+    requestDurationMs: rootSpan.durationMs,
+    requestStartedAtUnixMs: rootSpan.startedAtUnixMs,
     spans: [...trace]
       .sort((left, right) => left.startedAtUnixMs - right.startedAtUnixMs || left.spanId.localeCompare(right.spanId))
       .map((span) => ({
@@ -209,9 +232,70 @@ function projectWaterfall(trace: readonly PublicSpan[]) {
         spanId: span.spanId,
         status: span.status,
       })),
-    startedAtUnixMs,
     traceId: trace[0]?.traceId ?? "00000000000000000000000000000000",
   };
+}
+
+type ProjectedTrace = ReturnType<typeof projectTrace>;
+
+function projectTimeSeries(traces: readonly ProjectedTrace[], generatedAt: number) {
+  const presentationStart = Math.max(0, generatedAt - PUBLIC_TRACE_STREAM.presentationDurationMs);
+  const boundaries = bucketBoundaries(presentationStart, generatedAt);
+  const sampledTraceIds = new Set(
+    [...traces].sort(compareTraceInterest).slice(0, MAX_PROJECTED_TRACE_SAMPLES).map((trace) => trace.traceId),
+  );
+  return {
+    bucketDurationMs: OBSERVABILITY_BUCKET_DURATION_MS,
+    buckets: boundaries.slice(0, -1).map((startUnixMs, index) => {
+      const endUnixMs = boundaries[index + 1]!;
+      const bucketTraces = traces.filter((trace) =>
+        trace.requestStartedAtUnixMs >= startUnixMs
+          && (index === boundaries.length - 2
+            ? trace.requestStartedAtUnixMs <= endUnixMs
+            : trace.requestStartedAtUnixMs < endUnixMs)
+      );
+      const requestDurations = bucketTraces
+        .map((trace) => trace.requestDurationMs)
+        .sort((left, right) => left - right);
+      return {
+        endUnixMs,
+        errorCount: bucketTraces.filter((trace) => trace.error).length,
+        requestMaxMs: requestDurations.at(-1) ?? 0,
+        requestP95Ms: percentile(requestDurations, 0.95),
+        sampleTraceIds: bucketTraces
+          .filter((trace) => sampledTraceIds.has(trace.traceId))
+          .map((trace) => trace.traceId),
+        startUnixMs,
+        traceCount: bucketTraces.length,
+      };
+    }),
+  };
+}
+
+function compareTraceInterest(left: ProjectedTrace, right: ProjectedTrace): number {
+  const leftRuntimeSides = new Set(left.spans.map((span) => span.runtimeSide)).size;
+  const rightRuntimeSides = new Set(right.spans.map((span) => span.runtimeSide)).size;
+  return Number(right.error) - Number(left.error)
+    || rightRuntimeSides - leftRuntimeSides
+    || right.spans.length - left.spans.length
+    || right.requestDurationMs - left.requestDurationMs
+    || right.requestStartedAtUnixMs - left.requestStartedAtUnixMs
+    || left.traceId.localeCompare(right.traceId);
+}
+
+/** Clips the wall-clock grid to the exact presentation interval at both edges. */
+function bucketBoundaries(presentationStart: number, generatedAt: number): number[] {
+  if (generatedAt <= presentationStart) return [presentationStart, generatedAt];
+  const boundaries = [presentationStart];
+  let boundary = Math.ceil(presentationStart / OBSERVABILITY_BUCKET_DURATION_MS)
+    * OBSERVABILITY_BUCKET_DURATION_MS;
+  if (boundary === presentationStart) boundary += OBSERVABILITY_BUCKET_DURATION_MS;
+  while (boundary < generatedAt) {
+    boundaries.push(boundary);
+    boundary += OBSERVABILITY_BUCKET_DURATION_MS;
+  }
+  boundaries.push(generatedAt);
+  return boundaries;
 }
 
 function percentile(sortedValues: readonly number[], fraction: number): number {

@@ -31,7 +31,7 @@ flowchart TB
     discard["Shed optional telemetry<br/>at the launch cost ceiling"]
     admission["Worker-issued trace admission<br/>bounded snapshots and WebSockets"]
     room["SQLite Durable Object<br/>bounded complete traces and replay"]
-    project["Honeycomb-like public projection<br/>aggregates, heatmap, and waterfalls"]
+    project["Honeycomb-like public projection<br/>time buckets, aggregates, and trace details"]
 
     deploy --> worker
     worker --> ingest
@@ -99,7 +99,9 @@ The Worker converts accepted payloads into the strict schema in [src/domain/publ
 
 Persistence is trace-shaped. The Durable Object allows five seconds for out-of-order assembly, then retains complete traces for five minutes: at most 120 traces, 16 spans per trace, and 960 spans in total. Expiry and capacity eviction delete whole traces so the visualization never presents a broken waterfall. The current projection and at most 61 replay projections are separate bounded read models; they do not copy raw spans into another archive.
 
-The projection reports trace and span counts, error count and rate, `P50`, `P95`, and maximum span duration. It groups the same aggregates by runtime side and service, fills ten fixed duration buckets, and selects at most five slow traces with at most 16 waterfall spans each. [src/domain/public-observability.ts](../src/domain/public-observability.ts) owns that versioned contract. [src/domain/public-observability-sql.ts](../src/domain/public-observability-sql.ts) owns the singleton current projection, replay bounds, dirty cadence state, and restart recovery.
+The projection reports trace and span counts, span error rate, and `P50`, `P95`, and maximum span duration. It groups those span aggregates by runtime side and service and fills ten explicitly labelled span-duration bands. Runtime-side bars share total span count as their denominator; one trace may contribute spans to every side.
+
+The same projection derives wall-clock ten-second buckets across the exact five-minute window, clipping the first and last intervals at the presentation bounds. Each bucket reports trace count, error count, and `P95` and maximum root-request duration. The latency line breaks across empty intervals because silence has no percentile. A trace belongs to the bucket containing its root request timestamp; child clocks affect only waterfall offsets and the observed window. Root-request duration is distinct from the complete trace’s observed window: returning to a tab may add a later child span, but idle tab time cannot become request latency. At most 12 complete trace samples remain available for drilldown, ranked by errors, runtime coverage, joined span count, request duration, and root-request recency. The selected trace stays visible; an empty interval or a populated interval without a retained detail keeps and explicitly labels the previous selection locally, even after that trace leaves the bounded projection. An initially empty live window falls back to the labelled embedded example. No additional time-series rows are persisted because [src/domain/public-observability.ts](../src/domain/public-observability.ts) derives the buckets and samples from the bounded whole-trace store. [src/domain/public-observability-sql.ts](../src/domain/public-observability-sql.ts) owns the singleton current projection, replay bounds, dirty cadence state, and restart recovery.
 
 The recursion has a deliberate cutoff. Browser and Worker auto-instrumentation exclude the OTLP intake route. Telemetry ingestion, projection application, and the telemetry visualization’s paint loop do not export spans into the canonical stream they display. The page may show its final paint as a labeled local-only span, but exporting it would create an endless self-observation loop.
 
@@ -179,11 +181,11 @@ Snapshot and WebSocket admission run retention before reading storage. They cann
 
 ## Ownership and flow
 
-`src/domain/public-span.ts` owns the storage-safe span vocabulary and complete-trace invariants. `src/domain/public-trace-store.ts` owns assembly, whole-trace eviction, and alarm policy. `src/domain/public-observability.ts` owns the versioned aggregates, heatmap, slow-trace, waterfall, snapshot, and stream-envelope contracts. None of these modules performs I/O.
+`src/domain/public-span.ts` owns the storage-safe span vocabulary and complete-trace invariants. `src/domain/public-trace-store.ts` owns assembly, whole-trace eviction, and alarm policy. `src/domain/public-observability.ts` owns the versioned aggregates, clipped time buckets, duration bands, trace samples, snapshot, and stream-envelope contracts. None of these modules performs I/O.
 
 `src/worker/index.ts` owns Cloudflare I/O. It issues trace admissions, converts public OTLP, records server spans, invokes trace and projection storage inside Durable Object transactions, serves `GET /api/observability/snapshot`, and fans the `observability` envelope out through the hibernating `GET /api/stream` socket.
 
-`src/visualizations/observability-stream.ts` owns the observability page’s snapshot, WebSocket recovery, latest validated projection, disconnected expiry, and browser-cadence notification. `src/visualizations/observability.ts` owns persistent aggregate, heatmap, selector, and SVG waterfall nodes. Reducer application and final paint are local-only spans, so applying the projection cannot feed the stream it displays.
+`src/visualizations/observability-stream.ts` owns the observability page’s snapshot, WebSocket recovery, latest validated projection, disconnected expiry, and browser-cadence notification. `src/visualizations/observability.ts` owns persistent aggregate, time-bucket, duration-band, selector, and SVG waterfall nodes. Bucket selection is presentation state; the server remains the owner of aggregation and sample choice. Reducer application and final paint are local-only spans, so applying the projection cannot feed the stream it displays.
 
 ### Tail-latency prototype
 

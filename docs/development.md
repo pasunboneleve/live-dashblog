@@ -91,7 +91,7 @@ npm run test
 npm run build
 ```
 
-`npm run check` runs those commands in order. The focused tests cover strict public span and OTLP validation, Worker-bound admission, fixed-window burst and expiry behavior, joined parentage, out-of-order whole-trace assembly, exact SQLite trace and replay bounds, restart recovery, aggregate and heatmap derivation, slow-trace selection, waterfall geometry, sequence rejection, and the legacy tail-latency slice.
+`npm run check` runs those commands in order. The focused tests cover strict public span and OTLP validation, Worker-bound admission, fixed-window burst and expiry behavior, joined parentage, out-of-order whole-trace assembly, exact SQLite trace and replay bounds, restart recovery, aggregate and duration-band derivation, clipped time buckets, root-request clocks and latency, trace-sample selection, waterfall geometry, sequence rejection, and the legacy tail-latency slice.
 
 ## Rendered inspection
 
@@ -100,7 +100,9 @@ Before declaring a visualization production-ready, inspect the Worker-served art
 - no console error or failed asset request;
 - the WebSocket connects with `streams=observability`, replays only newer sequences, and pauses off-screen;
 - repeated visits do not produce more than one projection broadcast per five seconds;
-- the summary, runtime groups, and ten heatmap buckets match the snapshot response;
+- the summary, runtime-side shares, ten labelled duration bands, and 30 or 31 clipped time buckets match the snapshot response;
+- selecting a populated time bucket chooses its most informative retained trace; an empty bucket or a populated bucket without retained detail leaves the explicitly labelled previous trace visible;
+- request `P95` uses root-span duration, while the selected trace labels its separate observed window;
 - no more than five trace selectors and 16 keyed waterfall rows exist;
 - changing the selected trace updates `aria-pressed` and the waterfall description;
 - browser, Worker, and Durable Object bars remain distinguishable without motion;
