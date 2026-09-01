@@ -93,6 +93,8 @@ npm run build
 
 `npm run check` runs those commands in order. The focused tests cover strict public span and OTLP validation, Worker-bound admission, fixed-window burst and expiry behavior, joined parentage, out-of-order whole-trace assembly, exact SQLite trace and replay bounds, restart recovery, aggregate and duration-band derivation, clipped time buckets, root-request clocks and latency, trace-sample selection, waterfall geometry, sequence rejection, and the legacy tail-latency slice.
 
+For the tail-latency slice, confirm that a live point’s SVG `cx` decreases between animation frames without a new projection, the status reads only `live`, and scrolling the chart beyond its observer margin stops both the animation frame and page-level stream. With reduced motion enabled, points advance only on projection or expiry updates.
+
 ## Rendered inspection
 
 Before declaring a visualization production-ready, inspect the Worker-served article at desktop and narrow widths, plus zoom-equivalent scales near 80%, 100%, 125%, and 150%. Confirm:

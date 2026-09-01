@@ -67,7 +67,7 @@ export function mountObservability(root: HTMLElement): void {
     setText("[data-p50]", formatDuration(current.aggregates.overall.p50Ms));
     setText("[data-p95]", formatDuration(current.aggregates.overall.p95Ms));
     setText("[data-max]", formatDuration(current.aggregates.overall.maxMs));
-    setText("[data-sequence]", current.sequence === 0 ? "embedded example" : `live · sequence ${current.sequence}`);
+    setText("[data-sequence]", current.sequence === 0 ? "embedded example" : "live");
     const bounded = current.sampling.droppedTraceCount > 0;
     setText(
       "[data-sampling]",
