@@ -23,7 +23,7 @@ Persist sanitized spans by whole trace in a SQLite Durable Object. Each record c
 
 One stream declaration defines the presentation window, maximum traces, maximum spans per trace, maximum total spans, replay cap, and broadcast cadence. Expiry and capacity eviction remove whole traces. Parent-based sampling preserves the root decision across browser and server spans; intake shedding and hard storage caps remain independent safeguards. The public projection reports the sample rate.
 
-Derive Honeycomb-like aggregates and trace views from this bounded store. Initial projections include count, error count and rate, `P50`, `P95`, and maximum duration grouped only by allowlisted span name, runtime side, or service, plus selected slow-trace waterfalls. Do not create a separate raw archive or analytics warehouse.
+Derive Honeycomb-like aggregates and trace views from this bounded store. The projection includes count, error count and rate, `P50`, `P95`, and maximum span duration grouped only by allowlisted runtime side or service; explicitly labelled span-duration bands; wall-clock time buckets clipped to the presentation bounds whose latency metric and timestamp come from the root request; and bounded complete trace samples for drilldown. Do not create a separate raw archive or analytics warehouse.
 
 Exclude telemetry intake, projection application, and observability visualization rendering from export into the canonical stream. The renderer may expose a labeled local-only final span, but it cannot export that span back into the stream it displays.
 

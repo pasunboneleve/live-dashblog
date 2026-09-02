@@ -4,7 +4,7 @@
 
 Live Dashblog is a cost-restrained instrumented-essay blog. Astro publishes ordinary Markdown or MDX, while each post may import a purpose-built TypeScript visualization fed by a privacy-bounded projection of the Worker serving the site.
 
-The runtime post now explains its own request with joined browser, Worker, and Durable Object spans. It derives bounded Honeycomb-like aggregates, a duration heatmap, and trace waterfalls from a five-minute SQLite window. The development-metrics post remains planned.
+The runtime post now explains its own request with joined browser, Worker, and Durable Object spans. It derives a bounded Honeycomb-like request time series, explicit span-duration bands, and selectable trace waterfalls from a five-minute SQLite window. The development-metrics post remains planned.
 
 ## Architecture at a glance
 
@@ -13,7 +13,7 @@ Astro article + Worker-issued trace admission
   -> browser, Worker, and Durable Object OpenTelemetry spans
   -> strict same-origin OTLP boundary
   -> bounded whole-trace SQLite Durable Object
-  -> aggregate, heatmap, and waterfall projection replay
+  -> aggregate, time-bucket, duration-band, and trace-detail projection replay
   -> one hibernating page WebSocket
   -> latest projection buffer
   -> requestAnimationFrame
@@ -61,4 +61,4 @@ npm run check
 
 ## Status
 
-The Cloudflare scaffold is live on workers.dev, while the recursive observability implementation and its launch traffic ceilings are currently validated locally and await their normal review and deployment path. Cost notifications, the complete production smoke test, and the deployment-time development-metrics post remain open.
+The Cloudflare scaffold, recursive observability page, and launch traffic ceilings are live on workers.dev. Cost notifications, the remaining production smoke checks, and the deployment-time development-metrics post remain open.

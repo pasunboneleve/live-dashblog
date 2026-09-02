@@ -6,20 +6,17 @@ import {
 import { subscribeToTailLatency } from "./page-stream";
 import {
   createTailLatencyGeometry,
-  interpolateTailLatencyGeometry,
   projectionPresentationTime,
   type TailLatencyGeometry,
 } from "./tail-latency-geometry";
 import {
-  LatestValueAnimator,
+  AnimationFrameLoop,
   type AnimationFrameClock,
-} from "./latest-value-animator";
+} from "./animation-frame-loop";
 import { recordTelemetryHydrationComplete } from "../telemetry/browser-telemetry-hooks";
 
-const ANIMATION_DURATION_MS = 800;
 const browserFrameClock: AnimationFrameClock = {
   cancel: (handle) => cancelAnimationFrame(handle),
-  now: () => performance.now(),
   request: (callback) => requestAnimationFrame(callback),
 };
 
@@ -38,30 +35,31 @@ export function mountTailLatency(root: HTMLElement): void {
   const state = root.querySelector<HTMLElement>("[data-state]");
   const description = root.querySelector<SVGDescElement>("[data-chart-description]");
   const yMaximum = root.querySelector<SVGTextElement>("[data-y-maximum]");
-  const animator = new LatestValueAnimator<TailLatencyGeometry>({
+  const frameLoop = new AnimationFrameLoop({
     clock: browserFrameClock,
-    durationMs: ANIMATION_DURATION_MS,
-    interpolate: interpolateTailLatencyGeometry,
-    render: renderGeometry,
+    render: () => {
+      const geometry = presentCurrent();
+      if (!geometry || geometry.points.length === 0) frameLoop.pause();
+    },
   });
   const subscription = subscribeToTailLatency((projection) => {
     current = projection;
-    presentCurrent(true);
+    refreshPresentation();
   });
   const observer = new IntersectionObserver(([entry]) => {
     active = entry?.isIntersecting ?? false;
     subscription.setActive(active);
-    if (active) presentCurrent(false);
+    if (active) refreshPresentation();
     else {
-      animator.pause();
+      frameLoop.pause();
       clearExpiryTimer();
     }
   }, { rootMargin: "200px" });
-  const handleMotionPreference = (event: MediaQueryListEvent) => {
-    if (event.matches && active) presentCurrent(false);
+  const handleMotionPreference = () => {
+    if (active) refreshPresentation();
   };
   const handlePageHide = (event: PageTransitionEvent) => {
-    animator.pause();
+    frameLoop.pause();
     clearExpiryTimer();
     subscription.setActive(false);
     if (!event.persisted) dispose();
@@ -69,12 +67,12 @@ export function mountTailLatency(root: HTMLElement): void {
   const handlePageShow = (event: PageTransitionEvent) => {
     if (!event.persisted) return;
     subscription.setActive(active);
-    if (active) presentCurrent(false);
+    if (active) refreshPresentation();
   };
   const dispose = () => {
     active = false;
     clearExpiryTimer();
-    animator.dispose();
+    frameLoop.dispose();
     observer.disconnect();
     subscription.unsubscribe();
     motionPreference.removeEventListener("change", handleMotionPreference);
@@ -85,16 +83,28 @@ export function mountTailLatency(root: HTMLElement): void {
   window.addEventListener("pagehide", handlePageHide);
   window.addEventListener("pageshow", handlePageShow);
   observer.observe(root);
-  presentCurrent(false);
+  refreshPresentation();
   recordTelemetryHydrationComplete();
 
-  function presentCurrent(animate: boolean): void {
-    if (!active) return;
+  function refreshPresentation(): void {
+    const geometry = presentCurrent();
+    if (!geometry) return;
+    frameLoop.pause();
+    if (!motionPreference.matches && current.sequence > 0 && geometry.points.length > 0) {
+      clearExpiryTimer();
+      frameLoop.start();
+    } else {
+      scheduleExpiry(geometry);
+    }
+  }
+
+  function presentCurrent(): TailLatencyGeometry | null {
+    if (!active) return null;
     const now = projectionPresentationTime(current, Date.now());
     const geometry = createTailLatencyGeometry(current.points, now);
     updateProjectionText(geometry);
-    animator.setTarget(geometry, animate && !motionPreference.matches);
-    scheduleExpiry(geometry, now);
+    renderGeometry(geometry);
+    return geometry;
   }
 
   function renderGeometry(geometry: TailLatencyGeometry): void {
@@ -109,7 +119,7 @@ export function mountTailLatency(root: HTMLElement): void {
     if (latestValue) latestValue.textContent = geometry.latest ? formatMilliseconds(geometry.latest.durationMs) : "—";
     if (p95) p95.textContent = formatMilliseconds(geometry.p95Ms);
     if (count) count.textContent = String(geometry.points.length);
-    if (state) state.textContent = current.sequence === 0 ? "static snapshot" : `live · sequence ${current.sequence}`;
+    if (state) state.textContent = current.sequence === 0 ? "static snapshot" : "live";
     if (description) {
       description.textContent = geometry.latest
         ? `The latest request took ${formatMilliseconds(geometry.latest.durationMs)} milliseconds. It is the amber point at the right of ${Math.max(0, geometry.points.length - 1)} preceding requests in the last 60 seconds.`
@@ -117,13 +127,14 @@ export function mountTailLatency(root: HTMLElement): void {
     }
   }
 
-  function scheduleExpiry(geometry: TailLatencyGeometry, now: number): void {
+  function scheduleExpiry(geometry: TailLatencyGeometry): void {
     clearExpiryTimer();
+    const now = projectionPresentationTime(current, Date.now());
     const expiresAt = current.sequence === 0
       ? null
       : nextPresentationExpiry(TAIL_LATENCY_STREAM, geometry.points, now);
     if (expiresAt !== null) {
-      expiryTimer = window.setTimeout(() => presentCurrent(true), Math.max(0, expiresAt - Date.now()));
+      expiryTimer = window.setTimeout(refreshPresentation, Math.max(0, expiresAt - Date.now()));
     }
   }
 

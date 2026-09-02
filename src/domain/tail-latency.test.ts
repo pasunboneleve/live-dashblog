@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
   createTailLatencyGeometry,
-  interpolateTailLatencyGeometry,
   projectionPresentationTime,
 } from "../visualizations/tail-latency-geometry";
 import {
@@ -95,54 +94,14 @@ describe("tail latency projection", () => {
     expect(geometry.latest?.key).toBe("fresh");
   });
 
-  it("interpolates target-window geometry without retaining an expired point", () => {
-    const from = createTailLatencyGeometry([
-      sample(10, 1_000, "expired"),
-      sample(20, 2_000, "shared"),
-    ], 2_000);
-    const to = createTailLatencyGeometry([
-      sample(20, 2_000, "shared"),
-      sample(30, 3_000, "new"),
-    ], 3_000);
-    const halfway = interpolateTailLatencyGeometry(from, to, 0.5);
+  it("moves live points left as presentation time advances without a new projection", () => {
+    const points = [sample(20, 50_000, "first"), sample(30, 60_000, "latest")];
+    const initial = createTailLatencyGeometry(points, 60_000);
+    const advanced = createTailLatencyGeometry(points, 60_500);
 
-    expect(halfway.points.map((point) => point.key)).toEqual(["shared", "new"]);
-    expect(halfway.points).toHaveLength(to.points.length);
-    expect(halfway.points[0]?.x).toBe((from.points[1]!.x + to.points[0]!.x) / 2);
-    expect(halfway.points[1]?.x).toBe((from.points[1]!.x + to.points[1]!.x) / 2);
-    expect(interpolateTailLatencyGeometry(from, to, 1).linePath).toBe(to.linePath);
-  });
-
-  it("snaps between unrelated static and live datasets instead of collapsing their points", () => {
-    const fallback = createTailLatencyGeometry(
-      STATIC_FALLBACK_PROJECTION.points,
-      STATIC_FALLBACK_PROJECTION.generatedAt,
-    );
-    const liveNow = 1_800_000_000_000;
-    const live = createTailLatencyGeometry([
-      sample(20, liveNow - 30_000, "live-1"),
-      sample(30, liveNow, "live-2"),
-    ], liveNow);
-
-    expect(interpolateTailLatencyGeometry(fallback, live, 0)).toEqual(live);
-  });
-
-  it("keeps interpolated coordinates consistent with the displayed vertical scale", () => {
-    const from = createTailLatencyGeometry([
-      sample(20, 1_000, "shared"),
-      sample(25, 2_000, "old-latest"),
-    ], 2_000);
-    const to = createTailLatencyGeometry([
-      sample(20, 1_000, "shared"),
-      sample(100, 3_000, "new-latest"),
-    ], 3_000);
-    const halfway = interpolateTailLatencyGeometry(from, to, 0.5);
-    const shared = halfway.points[0]!;
-
-    expect(shared.y).toBeCloseTo(184 - (shared.durationMs / halfway.yMaximumMs) * 168);
-    expect(halfway.yMaximumMs).toBeGreaterThan(from.yMaximumMs);
-    expect(halfway.yMaximumMs).toBeLessThan(to.yMaximumMs);
-    expect(interpolateTailLatencyGeometry(from, to, 1)).toEqual(to);
+    expect(advanced.points.map((point) => point.key)).toEqual(initial.points.map((point) => point.key));
+    expect(advanced.points[0]!.x).toBeLessThan(initial.points[0]!.x);
+    expect(advanced.points[1]!.x).toBeLessThan(initial.points[1]!.x);
   });
 });
 

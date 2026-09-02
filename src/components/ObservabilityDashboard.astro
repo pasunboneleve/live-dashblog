@@ -1,19 +1,30 @@
 ---
 import { STATIC_OBSERVABILITY_PROJECTION } from "../domain/public-observability";
-import { createWaterfallGeometry } from "../visualizations/observability-geometry";
+import { createTimeSeriesGeometry, createWaterfallGeometry } from "../visualizations/observability-geometry";
 
 const projection = STATIC_OBSERVABILITY_PROJECTION;
-const selectedTrace = projection.slowTraces[0] ?? null;
+const selectedBucket = [...projection.timeSeries.buckets].reverse()
+  .find((bucket) => bucket.sampleTraceIds.length > 0) ?? projection.timeSeries.buckets.at(-1)!;
+const selectedIds = new Set(selectedBucket.sampleTraceIds);
+const selectedTrace = projection.traceSamples.find((trace) => selectedIds.has(trace.traceId))
+  ?? projection.traceSamples[0]
+  ?? null;
+const timeSeries = createTimeSeriesGeometry(projection.timeSeries.buckets);
 const waterfall = createWaterfallGeometry(selectedTrace);
-const heatMaximum = Math.max(1, ...projection.heatmap.map((bucket) => bucket.count));
-const runtimeMaximum = Math.max(1, ...projection.aggregates.byRuntimeSide.map((group) => group.count));
+const durationBandMaximum = Math.max(1, ...projection.durationBands.map((bucket) => bucket.count));
 
 function milliseconds(value: number): string {
-  return value < 10 ? value.toFixed(1) : Math.round(value).toString();
+  if (value >= 1_000) return `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)} s`;
+  return `${value < 10 ? value.toFixed(1) : Math.round(value)} ms`;
 }
 
 function percent(value: number): string {
   return `${(value * 100).toFixed(value > 0 && value < 0.1 ? 1 : 0)}%`;
+}
+
+function durationBand(lower: number, upper: number): string {
+  const format = (value: number) => value >= 1_000 ? `${value / 1_000}s` : `${value}ms`;
+  return `${format(lower)}–${format(upper === 60_001 ? 60_000 : upper)}`;
 }
 ---
 
@@ -23,71 +34,120 @@ function percent(value: number): string {
       <p class="eyebrow">This page · rolling five-minute trace window</p>
       <h2 id="observability-title">What just happened, joined end to end</h2>
     </div>
-    <p class="connection" data-sequence>embedded trace</p>
+    <p class="connection" data-sequence>embedded example</p>
   </header>
 
   <div class="summary" aria-live="polite">
     <div><span>traces</span><strong data-trace-count>{projection.traceCount}</strong></div>
     <div><span>spans</span><strong data-span-count>{projection.spanCount}</strong></div>
-    <div><span>errors</span><strong data-error-rate>{percent(projection.aggregates.overall.errorRate)}</strong></div>
-    <div><span>p50</span><strong data-p50>{milliseconds(projection.aggregates.overall.p50Ms)} ms</strong></div>
-    <div><span>p95</span><strong data-p95>{milliseconds(projection.aggregates.overall.p95Ms)} ms</strong></div>
-    <div><span>max</span><strong data-max>{milliseconds(projection.aggregates.overall.maxMs)} ms</strong></div>
+    <div><span>span errors</span><strong data-error-rate>{percent(projection.aggregates.overall.errorRate)}</strong></div>
+    <div><span>span p50</span><strong data-p50>{milliseconds(projection.aggregates.overall.p50Ms)}</strong></div>
+    <div><span>span p95</span><strong data-p95>{milliseconds(projection.aggregates.overall.p95Ms)}</strong></div>
+    <div><span>slowest span</span><strong data-max>{milliseconds(projection.aggregates.overall.maxMs)}</strong></div>
   </div>
+
+  <section class="time-series-section" aria-labelledby="time-series-title">
+    <div class="section-heading">
+      <div>
+        <h3 id="time-series-title">Requests over time</h3>
+        <p>Bars count traces started in each 10-second interval. The line is p95 root-request duration on a logarithmic scale, so one long-lived tab cannot flatten ordinary requests.</p>
+      </div>
+      <div class="chart-legend" aria-label="Chart legend">
+        <span><i class="legend-bar"></i>trace count</span>
+        <span><i class="legend-line"></i>request p95</span>
+      </div>
+    </div>
+    <svg class="time-series" data-time-series viewBox={timeSeries.viewBox} role="img" aria-labelledby="time-series-svg-title time-series-svg-description">
+      <title id="time-series-svg-title">Trace count and request latency over five minutes</title>
+      <desc id="time-series-svg-description" data-time-series-description>Select a populated interval to inspect one of its retained traces below.</desc>
+      <line class="axis" x1="54" x2="706" y1="168" y2="168"></line>
+      <text class="axis-label" data-time-series-max x="0" y="23">{milliseconds(timeSeries.maximumRequestMs)}</text>
+      <text class="axis-label" x="10" y="171">0 ms</text>
+      <text class="axis-label" x="54" y="198">5 min ago</text>
+      <text class="axis-label" x="706" y="198" text-anchor="end">now</text>
+      <path class="latency-line" data-latency-line d={timeSeries.linePath}></path>
+      <g data-time-buckets>
+        {timeSeries.buckets.map((bucket) => (
+          <g class:list={["time-bucket", { selected: bucket.startUnixMs === selectedBucket.startUnixMs }]} data-bucket-start={bucket.startUnixMs} role="button" tabindex="0" aria-pressed={bucket.startUnixMs === selectedBucket.startUnixMs ? "true" : "false"} aria-label={`${bucket.traceCount} traces; select this 10-second interval`}>
+            <rect class="bucket-hit" x={bucket.x} y="18" width={bucket.width} height="150"></rect>
+            <rect class="trace-bar" x={bucket.x} y={168 - bucket.barHeight} width={bucket.width} height={bucket.barHeight}></rect>
+            {bucket.pointY !== null && <circle class="latency-point" cx={bucket.x + bucket.width / 2} cy={bucket.pointY} r="3.5"></circle>}
+          </g>
+        ))}
+      </g>
+    </svg>
+    <p class="selection-note" data-bucket-summary>Select a populated interval to inspect one retained trace. Empty intervals remain visible because silence is part of the story.</p>
+  </section>
 
   <div class="detail-grid">
     <section aria-labelledby="runtime-title">
-      <h3 id="runtime-title">Runtime sides</h3>
+      <h3 id="runtime-title">Where the recorded spans ran</h3>
+      <p class="explanation">These are shares of all spans, not shares of traces. One joined trace can contribute spans to every runtime.</p>
       <div class="runtime-groups">
         {projection.aggregates.byRuntimeSide.map((group) => (
           <div class="runtime-row" data-runtime={group.key}>
-            <div><strong>{group.key}</strong><span data-runtime-count>{group.count} spans · {percent(group.errorRate)} errors</span></div>
-            <meter min="0" max={runtimeMaximum} value={group.count}>{group.count}</meter>
+            <div><strong>{group.key}</strong><span data-runtime-count>{group.count} of {projection.spanCount} spans · {percent(group.errorRate)} errors</span></div>
+            <meter min="0" max={Math.max(1, projection.spanCount)} value={group.count}>{group.count}</meter>
           </div>
         ))}
       </div>
     </section>
 
-    <section aria-labelledby="heatmap-title">
-      <h3 id="heatmap-title">Duration distribution</h3>
-      <div class="heatmap" aria-label="Span duration histogram">
-        {projection.heatmap.map((bucket, index) => {
-          const intensity = Math.ceil(bucket.count / heatMaximum * 5);
-          return <span
-            class={`heat-cell heat-${intensity}`}
-            data-heat-index={index}
-            title={`${bucket.count} spans from ${bucket.lowerBoundMs} to ${bucket.upperBoundMs} milliseconds`}
-          >{bucket.count}</span>;
+    <section aria-labelledby="duration-bands-title">
+      <h3 id="duration-bands-title">How long individual spans took</h3>
+      <p class="explanation">Each cell is one duration band. The number is the spans in that band; stronger colour means a larger count. This is not end-to-end trace latency.</p>
+      <div class="duration-bands" aria-label="Span duration histogram">
+        {projection.durationBands.map((bucket, index) => {
+          const intensity = Math.ceil(bucket.count / durationBandMaximum * 5);
+          return <span class={`heat-cell heat-${intensity}`} data-heat-index={index}><strong>{bucket.count}</strong><small>{durationBand(bucket.lowerBoundMs, bucket.upperBoundMs)}</small></span>;
         })}
       </div>
-      <div class="heat-labels" aria-hidden="true"><span>0 ms</span><span>60 s</span></div>
     </section>
   </div>
 
   <section class="waterfall-section" aria-labelledby="waterfall-title">
     <div class="waterfall-heading">
-      <div><h3 id="waterfall-title">Slow traces</h3><p data-sampling>{percent(projection.sampling.sampleRate)} admitted · {projection.sampling.droppedTraceCount} dropped</p></div>
-      <div class="trace-choices" data-trace-choices aria-label="Select a slow trace">
-        {projection.slowTraces.map((trace, index) => (
-          <button type="button" data-trace-id={trace.traceId} aria-pressed={index === 0 ? "true" : "false"}>
-            {milliseconds(trace.durationMs)} ms{trace.error ? " · error" : ""}
-          </button>
+      <div>
+        <h3 id="waterfall-title">Selected trace</h3>
+        <p class="trace-summary" data-selected-trace-summary>{selectedTrace ? `${milliseconds(selectedTrace.requestDurationMs)} request · ${milliseconds(waterfall.initialActivityMs)} initial activity · ${milliseconds(selectedTrace.observedWindowMs)} observed · ${selectedTrace.spans.length} joined spans` : "Embedded example"}</p>
+        <p class="sampling" data-sampling>{percent(projection.sampling.sampleRate)} admitted · {projection.sampling.droppedTraceCount} dropped</p>
+      </div>
+      <div class="trace-choices" data-trace-choices aria-label="Select a trace from this interval">
+        {projection.traceSamples.filter((trace) => selectedIds.has(trace.traceId)).map((trace) => (
+          <button type="button" data-trace-id={trace.traceId} aria-pressed={trace.traceId === selectedTrace?.traceId ? "true" : "false"}>{milliseconds(trace.requestDurationMs)} request · {trace.spans.length} spans{trace.error ? " · error" : ""}</button>
         ))}
       </div>
     </div>
-    <p class="empty" data-empty hidden={selectedTrace !== null}>No complete traces remain in the current five-minute window.</p>
     <svg data-waterfall viewBox={waterfall.viewBox} role="img" aria-labelledby="waterfall-svg-title waterfall-svg-description">
-      <title id="waterfall-svg-title">Joined browser, Worker, and Durable Object spans</title>
-      <desc id="waterfall-svg-description" data-waterfall-description>{selectedTrace ? `${selectedTrace.spans.length} joined spans across ${milliseconds(selectedTrace.durationMs)} milliseconds.` : "No complete traces remain in the current five-minute window."}</desc>
+      <title id="waterfall-svg-title">Selected browser, Worker, and Durable Object trace</title>
+      <desc id="waterfall-svg-description" data-waterfall-description>{selectedTrace ? `${waterfall.spans.length} spans scaled across ${milliseconds(waterfall.initialActivityMs)} of contiguous initial activity. Activity after a one-second gap is listed below and does not change the chart scale.` : "Embedded joined trace example."}</desc>
       <g data-waterfall-rows>
         {waterfall.spans.map((span) => (
           <g data-span-id={span.spanId}>
             <text x="0" y={span.y + 12}>{span.label}</text>
             <rect class={`span-bar ${span.runtimeSide}`} x={span.x} y={span.y} width={span.barWidth} height="16"></rect>
+            <text class="duration-label" x="712" y={span.y + 12} text-anchor="end">{span.durationLabel}</text>
           </g>
         ))}
       </g>
     </svg>
+    <div class="runtime-legend" aria-label="Trace runtime colours"><span class="browser">browser</span><span class="worker">Worker</span><span class="durable-object">Durable Object</span></div>
+    <section class="later-activity" data-later-activity hidden={waterfall.laterSpans.length === 0} aria-labelledby="later-activity-title">
+      <div>
+        <h4 id="later-activity-title">Later page activity</h4>
+        <p data-later-activity-summary>{waterfall.laterSpans.length} spans resumed after at least one quiet second. They remain joined to this trace without stretching the initial-activity clock.</p>
+      </div>
+      <ol data-later-spans>
+        {waterfall.laterSpans.map((span) => (
+          <li data-later-span-id={span.spanId}>
+            <span class={`activity-runtime ${span.runtimeSide}`} aria-hidden="true"></span>
+            <strong>{span.label}</strong>
+            <span>{span.offsetLabel} from request</span>
+            <span>{span.durationLabel}</span>
+          </li>
+        ))}
+      </ol>
+    </section>
   </section>
 
   <p class="footnote">Only allowlisted operation names, runtime classes, status, duration, and trace relationships reach this view. Intake and rendering do not observe themselves.</p>
@@ -100,49 +160,89 @@ function percent(value: number): string {
 
 <style>
   .observability { border: 1px solid var(--line); border-radius: 0.75rem; overflow: hidden; background: color-mix(in srgb, var(--surface) 94%, black); }
-  .panel-heading, .waterfall-heading { display: flex; align-items: start; justify-content: space-between; gap: 1.5rem; padding: 1.25rem 1.35rem; }
-  .eyebrow, .connection, .waterfall-heading p { margin: 0; color: var(--cyan); font-size: 0.68rem; letter-spacing: 0.14em; text-transform: uppercase; }
+  .panel-heading, .waterfall-heading, .section-heading { display: flex; align-items: start; justify-content: space-between; gap: 1.5rem; padding: 1.25rem 1.35rem; }
+  .eyebrow, .connection, .sampling { margin: 0; color: var(--cyan); font-size: 0.68rem; letter-spacing: 0.14em; text-transform: uppercase; }
   h2, h3 { margin: 0.28rem 0 0; color: var(--ink); font-weight: 550; letter-spacing: -0.025em; }
   h2 { font-size: 1.35rem; } h3 { font-size: 1rem; }
   .summary { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); border-block: 1px solid var(--line); }
   .summary div { padding: 1rem 1.1rem; border-right: 1px solid var(--line); }
   .summary div:last-child { border-right: 0; }
-  .summary span, .runtime-row span { display: block; color: var(--muted); font-size: 0.68rem; letter-spacing: 0.12em; text-transform: uppercase; }
+  .summary span, .runtime-row span { display: block; color: var(--muted); font-size: 0.68rem; letter-spacing: 0.1em; text-transform: uppercase; }
   .summary strong { display: block; margin-top: 0.35rem; color: var(--ink); font-size: 1.35rem; }
-  .detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; padding: 1.35rem; border-bottom: 1px solid var(--line); }
+  .time-series-section { padding-bottom: 0.8rem; border-bottom: 1px solid var(--line); }
+  .section-heading { padding-bottom: 0.2rem; }
+  .section-heading p, .explanation, .selection-note, .trace-summary { max-width: 48rem; margin: 0.45rem 0 0; color: var(--muted); font-size: 0.76rem; line-height: 1.5; }
+  .chart-legend { display: flex; flex-shrink: 0; gap: 1rem; color: var(--muted); font-size: 0.7rem; }
+  .chart-legend span { display: flex; align-items: center; gap: 0.4rem; }
+  .chart-legend i { display: inline-block; width: 1rem; }
+  .legend-bar { height: 0.55rem; background: color-mix(in srgb, var(--cyan) 35%, transparent); }
+  .legend-line { height: 2px; background: var(--amber); }
+  .time-series, [data-waterfall] { display: block; width: 100%; overflow: visible; }
+  .time-series { min-height: 13rem; padding-inline: 0.8rem; }
+  .axis { stroke: var(--line); }
+  .axis-label { fill: var(--muted); font-size: 9px; }
+  .latency-line { fill: none; stroke: var(--amber); stroke-linecap: round; stroke-linejoin: round; stroke-width: 3; }
+  .observability :global(.bucket-hit) { fill: transparent; }
+  .observability :global(.trace-bar) { fill: color-mix(in srgb, var(--cyan) 68%, transparent); }
+  .observability :global(.latency-point) { fill: var(--amber); stroke: var(--surface); stroke-width: 2; }
+  .observability :global(.time-bucket) { cursor: pointer; outline: none; }
+  .observability :global(.time-bucket:hover .bucket-hit), .observability :global(.time-bucket:focus .bucket-hit), .observability :global(.time-bucket.selected .bucket-hit) { fill: color-mix(in srgb, var(--amber) 8%, transparent); stroke: var(--amber); stroke-width: 1; }
+  .selection-note { margin: 0 1.35rem; }
+  .detail-grid { display: grid; grid-template-columns: 0.9fr 1.1fr; gap: 2rem; padding: 1.35rem; border-bottom: 1px solid var(--line); }
   .runtime-groups { display: grid; gap: 0.85rem; margin-top: 1rem; }
   .runtime-row div { display: flex; justify-content: space-between; gap: 1rem; }
   .runtime-row strong { color: var(--ink); font-size: 0.82rem; }
   meter { width: 100%; height: 0.45rem; accent-color: var(--cyan); }
-  .heatmap { display: grid; grid-template-columns: repeat(10, 1fr); gap: 0.25rem; margin-top: 1rem; }
-  .heat-cell { display: grid; min-height: 2.8rem; place-items: center; border-radius: 0.2rem; color: var(--ink); font-size: 0.72rem; }
+  .duration-bands { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 0.3rem; margin-top: 1rem; }
+  .heat-cell { display: grid; min-height: 3.25rem; place-items: center; border-radius: 0.2rem; color: var(--ink); font-size: 0.78rem; }
+  .heat-cell small { color: currentColor; font-size: 0.58rem; opacity: 0.76; }
   .heat-0 { background: color-mix(in srgb, var(--surface) 80%, black); color: var(--muted); }
   .heat-1 { background: color-mix(in srgb, var(--cyan) 12%, var(--surface)); }
   .heat-2 { background: color-mix(in srgb, var(--cyan) 24%, var(--surface)); }
   .heat-3 { background: color-mix(in srgb, var(--cyan) 38%, var(--surface)); }
   .heat-4 { background: color-mix(in srgb, var(--cyan) 56%, var(--surface)); }
   .heat-5 { background: color-mix(in srgb, var(--cyan) 76%, var(--surface)); color: #061012; }
-  .heat-labels { display: flex; justify-content: space-between; margin-top: 0.35rem; color: var(--muted); font-size: 0.65rem; }
   .waterfall-section { padding-bottom: 1rem; }
   .waterfall-heading { padding-bottom: 0.7rem; }
-  .trace-choices { display: flex; flex-wrap: wrap; justify-content: end; gap: 0.4rem; }
+  .trace-summary { color: var(--ink); }
+  .sampling { margin-top: 0.35rem; }
+  .trace-choices { display: flex; max-width: 55%; flex-wrap: wrap; justify-content: end; gap: 0.4rem; }
   .observability :global(button) { border: 1px solid var(--line); border-radius: 999px; padding: 0.4rem 0.65rem; background: transparent; color: var(--muted); font: inherit; font-size: 0.72rem; cursor: pointer; }
   .observability :global(button[aria-pressed="true"]) { border-color: var(--amber); color: var(--ink); }
-  svg { display: block; width: 100%; min-height: 9rem; padding-inline: 1.35rem; overflow: visible; }
-  .observability :global(text) { fill: var(--muted); font-size: 10px; }
+  [data-waterfall] { min-height: 9rem; padding-inline: 1.35rem; }
+  .observability :global([data-waterfall] text) { fill: var(--muted); font-size: 10px; }
+  .observability :global(.duration-label) { fill: var(--ink); }
   .observability :global(.span-bar) { rx: 3px; }
   .observability :global(.span-bar.browser) { fill: var(--cyan); }
   .observability :global(.span-bar.worker) { fill: var(--amber); }
   .observability :global(.span-bar.durable-object) { fill: #a78bfa; }
-  .empty, .footnote { color: var(--muted); font-size: 0.75rem; }
-  .empty { padding: 1rem 1.35rem; }
-  .footnote { margin: 0; padding: 1rem 1.35rem 0; border-top: 1px solid var(--line); }
+  .runtime-legend { display: flex; gap: 0.75rem; padding: 0.4rem 1.35rem 0; color: var(--muted); font-size: 0.68rem; }
+  .runtime-legend span::before { display: inline-block; width: 0.55rem; height: 0.55rem; margin-right: 0.35rem; border-radius: 999px; content: ""; }
+  .runtime-legend .browser::before { background: var(--cyan); }
+  .runtime-legend .worker::before { background: var(--amber); }
+  .runtime-legend .durable-object::before { background: #a78bfa; }
+  .later-activity { margin: 1rem 1.35rem 0; padding-top: 1rem; border-top: 1px solid var(--line); }
+  .later-activity[hidden] { display: none; }
+  .later-activity h4 { margin: 0; color: var(--ink); font-size: 0.82rem; font-weight: 550; }
+  .later-activity p { margin: 0.3rem 0 0; color: var(--muted); font-size: 0.72rem; line-height: 1.5; }
+  .later-activity ol { display: grid; gap: 0.35rem; margin: 0.8rem 0 0; padding: 0; list-style: none; }
+  .later-activity :global(li) { display: grid; grid-template-columns: auto minmax(10rem, 1fr) auto auto; align-items: center; gap: 0.7rem; padding: 0.45rem 0.6rem; border-radius: 0.25rem; background: color-mix(in srgb, var(--surface) 84%, black); color: var(--muted); font-size: 0.7rem; }
+  .later-activity :global(li strong) { color: var(--ink); font-weight: 500; }
+  .observability :global(.activity-runtime) { width: 0.5rem; height: 0.5rem; border-radius: 999px; background: var(--cyan); }
+  .observability :global(.activity-runtime.worker) { background: var(--amber); }
+  .observability :global(.activity-runtime.durable-object) { background: #a78bfa; }
+  .footnote { margin: 0; padding: 1rem 1.35rem; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.75rem; }
   @media (max-width: 760px) {
-    .panel-heading, .waterfall-heading { display: block; }
-    .connection, .trace-choices { margin-top: 0.8rem; justify-content: start; }
+    .panel-heading, .waterfall-heading, .section-heading { display: block; }
+    .connection, .trace-choices, .chart-legend { max-width: none; margin-top: 0.8rem; justify-content: start; }
     .summary { grid-template-columns: repeat(3, 1fr); }
     .summary div:nth-child(3) { border-right: 0; }
     .summary div:nth-child(-n + 3) { border-bottom: 1px solid var(--line); }
     .detail-grid { grid-template-columns: 1fr; }
+    .duration-bands { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .later-activity :global(li) { grid-template-columns: auto minmax(9rem, 1fr) auto; }
+    .later-activity :global(li span:last-child) { display: none; }
+    .time-series, [data-waterfall] { min-width: 42rem; }
+    .time-series-section, .waterfall-section { overflow-x: auto; }
   }
 </style>
